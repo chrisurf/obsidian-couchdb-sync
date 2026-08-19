@@ -2059,10 +2059,11 @@ export class SyncEngine {
 		if (!this.settings.isMaster) return;
 		try {
 			// This doc REPLICATES to the server (other devices read it to learn who
-			// the master is), so the device id must not travel in cleartext when
-			// E2EE is on — encrypt it into a `meta` blob exactly like file metadata.
+			// the master is) — hence putSharedDoc, which is the method that says so.
+			// The device id must therefore not travel in cleartext when E2EE is on:
+			// encrypt it into a `meta` blob exactly like file metadata.
 			if (encActive(this.settings)) {
-				await this.db.putLocalDoc(MASTER_INFO_ID, {
+				await this.db.putSharedDoc(MASTER_INFO_ID, {
 					type: "masterinfo",
 					enc: true,
 					meta: await encryptString(
@@ -2071,7 +2072,7 @@ export class SyncEngine {
 					),
 				});
 			} else {
-				await this.db.putLocalDoc(MASTER_INFO_ID, {
+				await this.db.putSharedDoc(MASTER_INFO_ID, {
 					type: "masterinfo",
 					masterId: this.settings.deviceId,
 				});

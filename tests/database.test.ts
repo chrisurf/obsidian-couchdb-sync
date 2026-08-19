@@ -188,6 +188,33 @@ describe("SyncDatabase per-device local docs", () => {
 	it("getLocalDoc returns null when absent", async () => {
 		expect(await db.getLocalDoc("_local/missing")).toBeNull();
 	});
+
+	// R5: whether a document replicates is decided by its id, not by the method that
+	// wrote it. The two methods exist so a caller has to state which it means, and
+	// these guards are what make the wrong choice fail loudly instead of quietly
+	// pushing per-device state to the server (or stranding shared state on one device).
+	it("putLocalDoc refuses an id that would replicate", async () => {
+		await expect(db.putLocalDoc("couchdb-sync:masterinfo", { a: 1 })).rejects.toThrow(
+			/_local\//
+		);
+	});
+
+	it("putSharedDoc refuses a non-replicating id", async () => {
+		await expect(db.putSharedDoc("_local/state", { a: 1 })).rejects.toThrow(/cannot replicate/);
+	});
+
+	it("getLocalDoc refuses an id that is not per-device", async () => {
+		await expect(db.getLocalDoc("couchdb-sync:masterinfo")).rejects.toThrow(/_local\//);
+	});
+
+	it("putSharedDoc round-trips a replicating document", async () => {
+		await db.putSharedDoc("couchdb-sync:masterinfo", { type: "masterinfo", masterId: "dev-1" });
+		await db.putSharedDoc("couchdb-sync:masterinfo", { type: "masterinfo", masterId: "dev-2" });
+		const doc = (await db.local.get("couchdb-sync:masterinfo")) as unknown as {
+			masterId: string;
+		};
+		expect(doc.masterId).toBe("dev-2");
+	});
 });
 
 // B7: a wrong passphrase must be DETECTABLE, not silently reported as an empty
