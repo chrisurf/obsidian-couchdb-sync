@@ -595,7 +595,10 @@ export class CouchDBSyncSettingTab extends PluginSettingTab {
 							"orphaned data, the entire version history. Drops the whole database if your account " +
 							"is allowed to; otherwise it deletes every document instead, which needs no more " +
 							"rights than syncing. Use this when the server state is wrong and this vault is the " +
-							"copy you trust.",
+							"copy you trust. " +
+							"It is also how you change your encryption passphrase: switch sync off, enter the new " +
+							"passphrase above, then reset — every file is re-uploaded under the new key. Afterwards " +
+							"set the same passphrase on your other devices and wipe their local cache there.",
 						(setting) =>
 							setting.addButton((b) =>
 								b

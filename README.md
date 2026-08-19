@@ -279,9 +279,37 @@ Available from Obsidian's command palette (`Ctrl/Cmd + P`).
 | Upload to server | — | **This device wins on the server:** overwrite the server's copy of every file with this device's, and add local-only files. Server-only files are kept (not deleted). Affects every other device |
 | Wipe local cache | — | Deletes this device's copy. The server is not touched |
 
-> **Changing the passphrase changes how everything is stored.** If you change the
-> passphrase, wipe the local cache and start from a fresh, empty database —
-> otherwise old and new notes get mixed and neither side can read the other.
+| Reset the server from this device | — | **Start the server over:** delete everything on it and re-upload this device's files. Also how you change your passphrase (below) |
+
+### 🔁 Changing your passphrase
+
+Your passphrase is not a login you can just replace — it is the key everything on the
+server was locked with, *and* it decides the names your files are filed under. Change
+it and the server's existing contents become unreadable to you. So the passphrase is
+not changed so much as the server is rebuilt around the new one.
+
+On the device whose files you trust:
+
+1. **Switch sync off** (the toggle in the status panel). Do this *first* — the
+   passphrase field saves on every keystroke, and a sync running in the background
+   would upload files locked with a half-typed passphrase.
+2. **Enter the new passphrase** under *Connection & encryption*.
+3. Press **Reset server** under *Actions*, and confirm. It empties the server, discards
+   this device's cache and re-uploads every file under the new passphrase. Sync turns
+   itself back on.
+4. Wait until the counters read the same number three times over — e.g.
+   `112 / 112 local · 112 / 112 on server`.
+
+Then on **every other device**: switch sync off, enter the same new passphrase, press
+**Wipe local cache**, and switch sync back on. It downloads the vault afresh.
+
+> ⚠️ **The version history does not survive this.** The reset deletes everything on the
+> server, past versions included, and files that existed *only* on the server are gone
+> too — only the device you reset from is preserved. Copy anything you still need off
+> the other devices first.
+>
+> A device you forget will keep the old passphrase, fail to read anything, and can push
+> its old copy back. Work through all of them.
 
 ---
 
