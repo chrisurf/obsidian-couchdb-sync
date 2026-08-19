@@ -878,15 +878,38 @@ export class SyncEngine {
 			.getFiles()
 			.filter((f) => !this.skip(f.path))
 			.sort((a, b) => a.stat.size - b.stat.size); // fewest chunks first
+		// Counted and reported at the end. "Uploaded nothing, reported success" has three
+		// possible causes that look identical from outside — no files considered, every
+		// file adopted as already-identical, or every push failing into fail() (which
+		// logs the recoverable class at debug level, i.e. invisibly). Without this line
+		// they cannot be told apart from the outside.
+		let written = 0;
+		let adopted = 0;
+		let failed = 0;
 		for (const file of todo) {
 			if (this.aborted) return;
 			this.lastHash.delete(file.path);
 			try {
-				if (await this.pushFile(file)) this.markActivity();
+				if (await this.pushFile(file)) {
+					written++;
+					this.markActivity();
+				} else {
+					adopted++;
+				}
 			} catch (e) {
+				failed++;
 				this.fail(`uploading ${file.path}`, e);
 			}
 			await this.yieldToUi();
+		}
+		const summary = `[couchdb-sync] upload pass: ${todo.length} file(s) considered — ${written} written, ${adopted} unchanged/adopted, ${failed} failed`;
+		// Warn only when the outcome deserves attention: something failed, or a pass with
+		// files to consider moved nothing at all. A normal pass stays at debug level so
+		// this does not become the console noise the plugin guidelines warn about.
+		if (failed > 0 || (todo.length > 0 && written === 0 && adopted === 0)) {
+			console.warn(summary);
+		} else {
+			console.debug(summary);
 		}
 		if (this.settings.syncHidden) {
 			const adapter = this.app.vault.adapter;

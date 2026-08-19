@@ -794,15 +794,32 @@ export default class CouchDBSyncPlugin extends Plugin {
 	 * must wipe their local cache before they reconnect. The confirmation dialog says
 	 * so; there is nothing this device can do to enforce it.
 	 */
-	resetServerFromLocal(): Promise<void> {
+	async resetServerFromLocal(): Promise<void> {
 		this.engine?.abort();
 		this.restartLock = this.restartLock
 			.catch(() => undefined)
 			.then(() => this.doServerReset());
-		return this.restartLock;
+		const emptied = await this.restartLock.then(
+			() => this.resetEmptiedServer,
+			() => false
+		);
+		if (!emptied) return; // it failed and said why; do not start a session on top
+
+		// Start the upload as its OWN restart, after the reset's lock segment has been
+		// released — not from inside it. Kicked off in there, the upload ran as a
+		// detached task while the lock it was started from was still held; anything that
+		// aborted the engine in that window (a recovery restart, a queued action) made
+		// startUploadOnly return silently, and the reset finished having emptied the
+		// server and uploaded nothing. Going through restartSync is also the path the
+		// user's own "Force sync" takes, which is the one this has to match.
+		await this.restartSync();
 	}
 
+	/** Whether the last doServerReset actually emptied the server (drives the restart). */
+	private resetEmptiedServer = false;
+
 	private async doServerReset(): Promise<void> {
+		this.resetEmptiedServer = false; // set only once the server is actually empty
 		if (!this.secretsUnlocked && !(await this.ensureSecretsUnlocked())) {
 			this.setStatus(SYNC_STATE.ERROR, "Credentials are locked — unlock them first.");
 			return;
@@ -851,7 +868,11 @@ export default class CouchDBSyncPlugin extends Plugin {
 		// logs at debug level, so it did not even leave a visible trace. A fresh name has
 		// no connections to wait for and cannot be raced.
 		const stale = this.db;
+		const previousDbId = this.settings.localDbId;
 		this.settings.localDbId = generateDeviceId();
+		console.debug(
+			`[couchdb-sync] reset: local replica ${previousDbId} -> ${this.settings.localDbId}`
+		);
 		await this.saveSettings();
 		this.db = null;
 		this.reportInFlight = null;
@@ -859,18 +880,19 @@ export default class CouchDBSyncPlugin extends Plugin {
 		// costs disk space rather than correctness.
 		void stale?.destroyLocal().catch(() => undefined);
 
-		// Fresh replica, then index this device's files into it and push. Sync must be
-		// ON for the upload to run at all (doRestart's master switch), so a reset from
-		// a switched-off vault turns it on — the user just asked for an upload.
+		// Sync must be ON for the upload to run at all (doRestart's master switch), so a
+		// reset from a switched-off vault turns it on — the user just asked for an upload.
 		if (!this.settings.syncEnabled) {
 			this.settings.syncEnabled = true;
 			await this.saveSettings();
 		}
-		await this.doRestart("upload");
+		// The upload itself is started by the caller, once this lock segment is released.
+		this.setStatus(SYNC_STATE.IDLE, "Server emptied — uploading this device's files…");
+		this.resetEmptiedServer = true;
 		new Notice(
 			outcome.strategy === "dropped"
-				? "CouchDB Sync: the server database was rebuilt and now holds exactly this device's files."
-				: `CouchDB Sync: ${outcome.deleted} document(s) deleted on the server; it now holds exactly this device's files. ` +
+				? "CouchDB Sync: the server database was rebuilt; now uploading this device's files."
+				: `CouchDB Sync: ${outcome.deleted} document(s) deleted on the server; now uploading this device's files. ` +
 					"Your account may not drop databases, so deletion stubs remain — harmless, but the disk space " +
 					"comes back only when the server compacts.",
 			15000
