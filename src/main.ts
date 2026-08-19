@@ -405,6 +405,12 @@ export default class CouchDBSyncPlugin extends Plugin {
 		// Just settled? Refresh the drift summary so the bar can flip from a %
 		// to the checkmark immediately, without waiting for the periodic tick.
 		if (wasSyncing && state === SYNC_STATE.SYNCED) {
+			// Drop the cached server reading first. It is throttled to 15 s, which is
+			// right while nothing is happening but wrong at exactly this moment: work
+			// just finished, so the last reading is the stalest it will ever be, and the
+			// summary would report the server as behind for up to another 15 seconds
+			// after it had caught up.
+			this.remoteScan = null;
 			void this.refreshDriftSummary();
 		}
 	}
@@ -480,9 +486,26 @@ export default class CouchDBSyncPlugin extends Plugin {
 			if (!report) {
 				this.effectiveDrift = null;
 			} else {
-				const drift = report.localOnly.length + report.dbOnly.length + report.drift.length;
-				const total = report.inSync.length + drift;
-				const pct = total === 0 ? 100 : Math.round((report.inSync.length / total) * 100);
+				// Everything that is NOT yet the same everywhere. Counted as a set of paths
+				// because the categories overlap — a drifting file can also be one the
+				// server has not seen — and summing the lengths would count it twice.
+				//
+				// notPushed and serverOnly belong in here: the status bar used to consider
+				// only disk-versus-replica, so its checkmark appeared while files were still
+				// queued for the server, disagreeing with the panel that reported them
+				// pending. Conflicts likewise — a conflicted file is not "in sync".
+				const behind = new Set<string>([
+					...report.localOnly,
+					...report.dbOnly,
+					...report.drift,
+					...report.conflicts,
+					...(report.notPushed ?? []),
+					...(report.serverOnly ?? []),
+				]);
+				const settled = report.inSync.filter((p) => !behind.has(p));
+				const drift = behind.size;
+				const total = settled.length + drift;
+				const pct = total === 0 ? 100 : Math.round((settled.length / total) * 100);
 				this.effectiveDrift = { drift, pct };
 
 				// Idle auto-resolve: when no session is running but the DB still holds
