@@ -709,6 +709,10 @@ export default class CouchDBSyncPlugin extends Plugin {
 		// A changed remote invalidates the cached server scan too, so the Server column
 		// never shows the previous server's state after the URL/db/user is edited.
 		this.remoteScan = null;
+		// …and the cached remote HANDLE, which carries the old credentials baked in
+		// (see SyncDatabase.closeRemote). Keeping it meant every later automatic scan
+		// re-authenticated with the password the user just replaced.
+		this.db?.closeRemote();
 		if (!this.settings.connectionVerified) return;
 		this.settings.connectionVerified = false;
 		await this.saveSettings();
@@ -934,6 +938,10 @@ export default class CouchDBSyncPlugin extends Plugin {
 		if (!this.settings.syncEnabled || !this.settings.serverUrl || !this.settings.connectionVerified) {
 			return undefined;
 		}
+		// Locked credentials mean the password in `settings` is empty. Probing on a
+		// timer with that is a stream of failed logins, which is exactly what gets a
+		// throttling server to lock the account — so touch no network until unlocked.
+		if (!this.secretsUnlocked) return undefined;
 		const now = Date.now();
 		const fresh = this.remoteScan && now - this.remoteScan.at < REMOTE_SCAN_TTL_MS;
 		if (!fresh && !this.remoteScanInFlight) {
@@ -1275,6 +1283,9 @@ export default class CouchDBSyncPlugin extends Plugin {
 			this.settings.password = opened.password;
 			this.settings.passphrase = opened.passphrase;
 			this.secretsUnlocked = true;
+			// Anything built while locked carries an empty password — throw it away so
+			// the first request after unlocking uses the real credentials.
+			this.db?.closeRemote();
 			return true;
 		};
 

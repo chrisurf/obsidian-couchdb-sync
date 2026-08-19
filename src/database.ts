@@ -224,6 +224,29 @@ export class SyncDatabase {
 		return this.remote;
 	}
 
+	/**
+	 * Drop the cached remote handle so the next use builds a fresh one.
+	 *
+	 * The handle bakes `auth` in at construction (see connectRemote), so it keeps
+	 * presenting whatever credentials were current when it was made — for its whole
+	 * lifetime. Without this, editing the password, or unlocking credentials that were
+	 * locked when the handle was built, left every automatic path (the idle server
+	 * scan reuses `this.remote`) authenticating with the OLD or EMPTY password on a
+	 * timer. A server that throttles repeated failed logins then locks the account out,
+	 * and the plugin can never recover on its own because nothing rebuilds the handle.
+	 */
+	closeRemote(): void {
+		if (!this.remote) return;
+		void this.remote.close().catch(() => undefined);
+		this.remote = null;
+		this.hydratedRemoteCache.clear();
+	}
+
+	/** Are there credentials to authenticate with at all? */
+	hasCredentials(): boolean {
+		return !!this.settings.username && !!this.settings.password;
+	}
+
 	/** Verify credentials + reachability. Returns a human-readable result. */
 	async testConnection(): Promise<{ ok: boolean; message: string }> {
 		try {
@@ -343,6 +366,21 @@ export class SyncDatabase {
 	 * render an honest "server unreachable (401)" instead of a false "in sync".
 	 */
 	async scanRemote(): Promise<RemoteScan> {
+		// Never send a login we know is incomplete. This runs on a timer, so an empty
+		// password (credentials still locked, or not entered yet) would otherwise become
+		// a steady drip of failed authentications — the fastest way to get throttled or
+		// locked out by the server.
+		if (!this.hasCredentials()) {
+			return {
+				reachable: false,
+				error: "auth",
+				message: "no credentials available",
+				paths: [],
+				conflicts: [],
+				count: 0,
+				decryptFailed: 0,
+			};
+		}
 		const r = this.remote ?? this.connectRemote();
 		let res: PouchDB.Core.AllDocsResponse<FileDoc>;
 		try {
