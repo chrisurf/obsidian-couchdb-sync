@@ -21,7 +21,10 @@ R1 to the front; it depends on nothing.
 Three items, none of which touches sync behaviour. They are independent, so a single
 PR is honest here rather than three.
 
-### 1. R8 Level 1 — document the Cloudflare Tunnel · XS (~30 min)
+**Items 1 and 2 are done**; item 3 is still open. Both are marked ✅ below with what
+actually shipped, since it differed from the plan in one place.
+
+### 1. ✅ R8 Level 1 — document the Cloudflare Tunnel · XS (~30 min)
 
 **Files:** `README.md` only. No code.
 
@@ -39,7 +42,7 @@ Nothing in the plugin knows or cares.
 
 ---
 
-### 2. R5 — rename `putLocalDoc` · XS (~20 min)
+### 2. ✅ R5 — rename `putLocalDoc` · XS (~20 min)
 
 **Files:** `src/database.ts:782`, plus 6 call sites (`src/engine.ts` ×4,
 `src/main.ts:768`).
@@ -54,9 +57,14 @@ Split it, so the type system enforces the distinction instead of a comment:
 - `putLocalDoc(id, value)` — asserts the `_local/` prefix, throws otherwise.
 - `putSharedDoc(id, value)` — the replicating variant, used by the master-info calls.
 
-**Done when:** `tsc` passes with every call site pointing at the right one. There is no
-behaviour to test — the compiler is the proof, and the split makes the wrong call
-impossible rather than merely discouraged.
+**Done when:** `tsc` passes with every call site pointing at the right one.
+
+**What shipped instead:** the prefix checks **throw at runtime** rather than relying on
+the compiler alone, and `getLocalDoc` asserts the same prefix so reads cannot drift
+either. That makes it no longer the pure refactor described above — so it is tested:
+four cases covering a wrong id on each method and a `putSharedDoc` round-trip. Without
+the guards this would have been a rename that the same mistake walks past in six
+months.
 
 **Why here and not later:** the next two items that touch this file, R2 (sentinel
 document) and R4 (tombstone sweep), both add callers. Renaming after they land means
@@ -214,17 +222,29 @@ that most wants its own PR and a manual two-device run before merging.
 
 ## Batch 4 — the big ones
 
-### 8. R8 Level 2 — Cloudflare Access · L (~1 week incl. verification)
+### 8. R8 Level 2 — Cloudflare Access · M–L (~2–3 days incl. verification)
 
-**Files:** `src/secrets.ts` (+ migration v7), `src/types.ts`, `src/database.ts`
-(`obsidianFetch`, `connectRemote`, `scanRemote`, `RemoteScan`), `src/settings.ts`,
-`src/main.ts` (`invalidateConnection`), README.
+**Files:** `src/types.ts`, `src/database.ts` (`obsidianFetch`, `connectRemote`,
+`scanRemote`, `RemoteScan`), `src/settings.ts`, `src/main.ts`
+(`invalidateConnection`), README. **Not** `src/secrets.ts`.
 
-The client secret is a credential, so it belongs in the sealed blob — that is the
-whole point of 0.40.0. That means extending `Secrets` and everything that walks it
-(`sealSecrets`, `unsealSecrets`, `decideSealAction`, `toPersisted`) plus a v7 migration
-so existing sealed blobs keep unsealing. The client *id* is not secret and stays in
-the persisted settings.
+**This got smaller than first estimated.** The original plan put the client secret
+into the sealed blob, which meant extending `Secrets`, threading it through
+`sealSecrets` / `unsealSecrets` / `decideSealAction` / `toPersisted`, and a schema
+migration v7 so existing blobs keep unsealing — work on the one path that already
+holds the user's password.
+
+None of that is needed. Both values go into `app.saveLocalStorage()`, which is
+vault-scoped and never written by `saveData()`, so they do not reach `data.json` in
+any form. That is not a weaker choice: the sealed blob's ceiling is "localStorage is
+safe" anyway, because the device key that opens it lives there. Same strength against
+local disk access, better against anything that carries the vault onward, and a
+migration less.
+
+Two things to note in code: two credentials now use two mechanisms (justified — an
+Access token should be per device, the CouchDB password is the same everywhere), and
+localStorage is plaintext and is lost when app data is cleared, so the token must be
+re-enterable.
 
 `obsidianFetch()` builds the header map for every request PouchDB makes and currently
 takes no arguments. Give it the settings or a header supplier, so the replication
@@ -237,16 +257,23 @@ Two things 0.40.0 already put in place, which this should use rather than re-der
   already calls it. This is exactly the trap the password fell into before 0.40.0: the
   handle bakes its fetch in at construction.
 - `RemoteScan.error` already has the `auth` / `notfound` / `network` vocabulary. Add
-  the Access rejection as a named cause there, so *Test connection* can say
-  "Cloudflare Access rejected the service token" instead of a JSON parse error from an
-  HTML login page.
+  the Access causes there. There are **three** to tell apart, not two: 401 with JSON
+  (CouchDB rejected the login), 403 (Access rejected the token), and a 302 or HTML
+  where JSON was expected (the Access policy is not set to *Service Auth*, so it
+  answers with an identity-provider login page). The third is the one no user
+  diagnoses unaided, and the one that reaches a JSON parser as a syntax error.
 
 **Must be measured, not assumed** — against a real tunnel:
 
-- **Idle timeout vs. the live feed.** Continuous replication holds a long-poll
-  `_changes` open; Cloudflare's proxy times out at 100 s on the free plan. The existing
-  `LIVE_SYNC_RESTART_LIMIT` and mobile resume recovery may absorb this — or a heartbeat
-  may be needed. Observe it over several minutes and write down what happened.
+- **Idle timeout vs. the live feed — likely a non-issue.** Cloudflare closes
+  connections idle for 100 s on free and pro. But PouchDB's HTTP adapter appends
+  `heartbeat=10000` to every changes request by default, and CouchDB then sends a
+  blank line every 10 s, so the connection is never idle that long. Confirm that is
+  what is happening rather than watching blindly for a disconnect; if it does drop,
+  the answer is a shorter heartbeat, not new machinery.
+- **Which status code Access actually returns** for a missing or invalid token —
+  Cloudflare does not document it. The three-case table above is the expected shape,
+  not a verified one.
 - **Request body limits.** 100 MB on the free plan. `CHUNK_SIZE` is 1 MiB so a single
   chunk is safe; check a large `_bulk_docs` batch against the cap.
 - **Service token expiry.** Tokens expire. A clear message when a working setup starts
@@ -285,14 +312,14 @@ this one to slip a release; that is the right call.
 
 | # | Item | Size | Risk | Blocks / blocked by |
 |---|---|---|---|---|
-| 1 | R8-L1 — tunnel docs | XS | none | — |
-| 2 | R5 — rename `putLocalDoc` | XS | none | do before R2, R4 |
+| 1 | ✅ R8-L1 — tunnel docs | XS | none | — |
+| 2 | ✅ R5 — split `putLocalDoc` | XS | none | did before R2, R4 as planned |
 | 3 | R1 — hard-skip `.git/` | S | low | — |
 | 4 | R7 — echo guard test | S | none | — |
 | 5 | R6 — heal loop test | M | none | — |
 | 6 | R3-1 — mobile size ceiling | M | low | — |
-| 7 | R2 — passphrase sentinel | M–L | **startup path** | after R5 |
-| 8 | R8-L2 — Cloudflare Access | L | medium | parallelisable |
+| 7 | R2 — passphrase sentinel | M–L | **startup path** | — |
+| 8 | R8-L2 — Cloudflare Access | M–L | medium | parallelisable |
 | 9 | R4 — tombstone sweep | L | **distributed correctness** | design note first |
 
 Items 1–3 are a single afternoon and a single PR. Items 4–5 are pure test work and can

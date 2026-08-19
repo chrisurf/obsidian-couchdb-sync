@@ -10,7 +10,8 @@ findings while describing a fixed codebase is worse than carrying none. Everythi
 still open from them is restated below with a current file reference; the originals
 remain in the git history.
 
-Nothing here is implemented yet. This document is the plan.
+This document is the plan. Items marked ✅ have since been implemented; everything
+else is still open.
 
 **Status legend:** 🔴 do first · 🟠 should ship in the same release · 🟡 nice to have
 · 🔵 new feature · ⚪ accepted, no action
@@ -123,7 +124,7 @@ sensibly slip to the release after.
 
 ---
 
-### R5 🟡 — `putLocalDoc` does not always write a local document
+### R5 ✅ — `putLocalDoc` does not always write a local document
 
 **Where:** `src/database.ts` — `putLocalDoc()`, called with `MASTER_INFO_ID`
 
@@ -137,6 +138,11 @@ but the name is a trap for the next person adding a call.
 
 **Fix:** rename to `putDoc` / `putRawDoc`, or split into `putLocalDoc` (asserts the
 `_local/` prefix) and `putSharedDoc`. Pure refactor, no behaviour change.
+
+**Done:** split into `putLocalDoc` / `putSharedDoc`, with `getLocalDoc` asserting the
+same prefix. Not the pure refactor foreseen here — the prefix checks throw at runtime,
+so the wrong id fails loudly instead of silently pushing per-device state to the
+server. Four tests cover the guards.
 
 ---
 
@@ -180,11 +186,14 @@ it can be built as one piece.**
 
 Two levels, and they need very different amounts of work:
 
-**Level 1 — plain tunnel, public hostname.** Already works today with no code change:
+**Level 1 ✅ — plain tunnel, public hostname.** Works with no code change:
 `cloudflared` publishes the CouchDB as `https://couch.example.com`, and the user types
-that URL into the existing server field. The tunnel is invisible to the plugin. This
-is a **documentation** task — a "Cloudflare Tunnel" path in the README's *Getting a
-server* section, alongside the existing options. Ship it with the feature.
+that URL into the existing server field. The tunnel is invisible to the plugin.
+
+**Done:** documented as *Option C* in the README's *Getting a server* section, with
+two warnings that matter more than the setup itself — a tunnel hides where the server
+is but does not lock the door, and an Access policy in front of the hostname breaks
+sync outright until Level 2 ships.
 
 **Level 2 — tunnel protected by Cloudflare Access.** This is the actual feature. With
 a Zero Trust policy in front of the hostname, an unauthenticated request is answered
@@ -194,15 +203,46 @@ a **service token**: two headers on every request, `CF-Access-Client-Id` and
 
 **Design:**
 
-- **Settings:** a toggle `cfAccessEnabled` (default off) plus `cfAccessClientId` and
-  `cfAccessClientSecret`, shown in the connection section only when the toggle is on.
-  Default off means existing configurations are untouched.
-- **The client secret is a credential.** It must go into the sealed blob, never into
-  `data.json` in the clear — the whole point of 0.40.0. That means extending
-  `Secrets` in `src/secrets.ts` and everything that walks it (`sealSecrets`,
-  `unsealSecrets`, `decideSealAction`, `toPersisted`) plus a schema migration (v7) so
-  an existing sealed blob keeps unsealing. The client *id* is not secret and can stay
-  in the persisted settings.
+- **Settings:** a toggle `cfAccessEnabled` (default off) plus two **separate,
+  labelled** fields for the client id and the client secret, shown in the connection
+  section only when the toggle is on. Default off means existing configurations are
+  untouched. The secret is a password input, with a Test button beside it.
+
+  Two named fields rather than one free-form "custom headers" box, deliberately: a
+  free box is more flexible, but the most common mistake is a mistyped header name,
+  and that surfaces as a silent 403 indistinguishable from a wrong password. Two
+  labelled fields remove the failure mode instead of documenting it. (Cloudflare also
+  supports `read_service_tokens_from_header` to carry both values in a single header
+  such as `Authorization` — worth knowing when someone later asks for a custom-header
+  option, not worth building first.)
+
+- **The credentials do NOT go into `data.json` at all** — not even sealed. They belong
+  in `app.saveLocalStorage()`, which is vault-scoped, lives outside the vault folder
+  and is never written by `saveData()`.
+
+  This deliberately departs from the mechanism 0.40.0 built for the CouchDB password.
+  The reasoning: the sealed blob's security ceiling is exactly "localStorage is safe",
+  because the device key that opens it lives there. Putting the token straight into
+  localStorage is therefore **equally strong against local disk access and stronger
+  against everything that carries the vault onward** — backups, file sync, a repo
+  mirror, a pasted bug report — because it is not in `data.json` in any form.
+
+  It also removes work rather than adding it: no extension of `Secrets` in
+  `src/secrets.ts`, nothing to thread through `sealSecrets` / `unsealSecrets` /
+  `decideSealAction` / `toPersisted`, and **no schema migration v7**. The credential
+  path that already holds the user's password stays untouched.
+
+  Two consequences to write down in the code, or the next reader will rightly ask:
+  two credentials now use two different mechanisms — justified because an Access
+  service token *should* be issued per device (revocation granularity) while the
+  CouchDB password is the same everywhere; and localStorage is plaintext on disk and
+  is lost when app data is cleared, so the token has to be re-entered on that device.
+
+  The precedent is [obsidian-git's `localStorageSettings.ts`](https://deepwiki.com/Vinzent03/obsidian-git/10-integration-with-other-tools),
+  which splits device-specific settings out of `data.json` exactly this way.
+  [LiveSync issue #773](https://github.com/vrtmrz/obsidian-livesync/issues/773) asks
+  for the same thing — still open, no maintainer response, so a model rather than a
+  precedent there.
 - **Header injection:** `obsidianFetch()` in `src/database.ts` builds the header map
   for every request PouchDB makes. It currently takes no arguments; give it the
   settings (or a header supplier) so both the replication handle from
@@ -212,20 +252,43 @@ a **service token**: two headers on every request, `CF-Access-Client-Id` and
 - **Handle invalidation:** the remote handle bakes its fetch in at construction, so
   editing the token must call `closeRemote()` — exactly the trap the password fell
   into before 0.40.0. Wire it into the existing `invalidateConnection()`.
-- **Error mapping:** an Access-protected endpoint without a valid token answers with
-  an HTML login page or a redirect. Without special handling that surfaces as a JSON
-  parse error or a bare transport failure. Map it to a named cause alongside the
-  existing `auth` / `notfound` / `network` in `RemoteScan`, so *Test connection* can
-  say "Cloudflare Access rejected the service token" instead of something unreadable.
+- **Error mapping — three cases, not two.** The obvious pair is "wrong password" and
+  "wrong token". There is a third, and it is the one nobody diagnoses unaided:
+
+  | Response | Cause | What to say |
+  |---|---|---|
+  | 401 with JSON | CouchDB rejected the login | check user name and password |
+  | 403 | Access rejected the service token | check the token, or it expired |
+  | 302 / HTML instead of JSON | Access policy is **not** set to *Service Auth* | set the policy action to Service Auth |
+
+  The third case is what an Access application does by default: it answers an
+  unauthenticated request with a redirect to an identity-provider login page. Setting
+  the policy action to **Service Auth** is what suppresses that prompt for machine
+  clients. Without handling it, an HTML login page reaches a JSON parser and the user
+  is told something unreadable about a syntax error.
+
+  Add the causes alongside the existing `auth` / `notfound` / `network` in
+  `RemoteScan`. That vocabulary already exists — this extends it rather than inventing
+  a parallel one.
+
+  **Unverified:** Cloudflare's documentation does not state which status code Access
+  returns for a missing or invalid service token. The table above is the expected
+  shape; confirm each row against a real tunnel before relying on the wording.
 
 **Risks to verify against a real tunnel before shipping:**
 
-- **Idle timeout vs. the live feed.** Continuous replication holds a long-poll
-  `_changes` request open. Cloudflare's proxy has its own idle timeout (100 s on the
-  free plan), which can close a feed the plugin believes is healthy. The existing
-  `LIVE_SYNC_RESTART_LIMIT` and the mobile resume recovery may already absorb this,
-  or a shorter heartbeat may be needed so the feed keeps itself alive. Must be
-  measured, not assumed.
+- **Idle timeout vs. the live feed — probably already solved, still measure.**
+  Continuous replication holds a long-poll `_changes` request open, and Cloudflare
+  closes connections idle for 100 s on the free and pro plans (only Enterprise can
+  change it). But PouchDB's HTTP adapter appends `heartbeat=10000` to every changes
+  request unless told otherwise, and CouchDB then emits a blank line every 10 seconds
+  — so the connection is never idle for 100 s in the first place.
+
+  That turns an open question into a specific one: watch a live feed for several
+  minutes and confirm the heartbeat traffic is what keeps it up, rather than watching
+  blindly for a disconnect that may never come. If it does drop, the fix is a shorter
+  heartbeat, not new machinery — and `LIVE_SYNC_RESTART_LIMIT` plus the mobile resume
+  recovery are the existing backstops.
 - **Request body limits.** Cloudflare caps request bodies (100 MB on the free plan).
   `CHUNK_SIZE` is 1 MiB so a single chunk is safe, but a large `_bulk_docs` batch is
   worth checking against the cap.
@@ -235,12 +298,15 @@ a **service token**: two headers on every request, `CF-Access-Client-Id` and
 
 **Acceptance:**
 
-- Unit tests: headers present when the toggle is on and absent when off; the sealing
-  round-trip with the new field; migration v7 over a v6 blob.
-- A manual verification against a real tunnel, with the idle-timeout behaviour of the
-  live feed observed over at least a few minutes and written down.
-- README: both levels documented — the plain tunnel as a server option, Access as the
-  toggle.
+- Unit tests: headers present when the toggle is on and absent when off; and — the
+  one that guards the whole storage decision — that `toPersisted()` output contains
+  neither the client id nor the secret, so a regression that routes them back through
+  `saveData()` fails the build rather than shipping.
+- A manual verification against a real tunnel: each row of the error table confirmed,
+  and the live feed observed for several minutes with the heartbeat behaviour written
+  down.
+- README: Level 1 is documented (Option C); replace its "do not use Access" warning
+  with the setup once the toggle exists.
 
 ---
 
