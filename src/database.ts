@@ -16,7 +16,7 @@ import {
 	hydrateVersion,
 	toStoredId,
 } from "./envelope";
-import { base64ToUint8, uint8ToBase64 } from "./util";
+import { base64ToUint8, toError, uint8ToBase64 } from "./util";
 
 const RANGE_END = "￿";
 
@@ -262,6 +262,13 @@ export class SyncDatabase {
 		}
 		const seen = wires.length;
 		let failed = 0;
+		/**
+		 * First decrypt failure of this scan. Reported ONCE at the end instead of once
+		 * per document: a locked or passphrase-less vault fails on every doc, which
+		 * turned a single condition into hundreds of identical stack traces in the
+		 * console — noise that buries whatever actually went wrong.
+		 */
+		let firstFailure: Error | undefined;
 		// Rebuilt each scan so docs that disappeared drop out of the cache (bounded).
 		const nextCache = new Map<string, { rev: string; doc: FileDoc }>();
 		const out: (FileDoc | null)[] = new Array<FileDoc | null>(wires.length).fill(null);
@@ -299,12 +306,17 @@ export class SyncDatabase {
 						nextCache.set(d._id, { rev: d._rev ?? "", doc });
 					} catch (e) {
 						failed++;
-						console.error("[couchdb-sync] cannot decrypt file doc", d._id, e);
+						firstFailure ??= toError(e);
 					}
 				})
 			);
 		}
 
+		if (failed > 0) {
+			console.warn(
+				`[couchdb-sync] ${failed} of ${seen} file doc(s) could not be decrypted: ${firstFailure?.message ?? "unknown error"}`
+			);
+		}
 		this.hydratedCache = nextCache;
 		// Remember whether a scan hit encrypted docs it could not decrypt at all —
 		// the index report uses this to detect a wrong passphrase (see getDecryptStats).

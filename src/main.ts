@@ -895,6 +895,12 @@ export default class CouchDBSyncPlugin extends Plugin {
 		// immediately and refreshes in the background — the local report must never wait
 		// on a network round-trip, so an unreachable server just leaves the Server column
 		// blank until the next refresh, instead of stalling the whole panel.
+		// Every file doc is decrypted to build this report, so without a usable
+		// passphrase there is nothing to report — only a scan that fails on every
+		// document. Bail out and let the status card explain the real reason (locked
+		// credentials, or no passphrase set yet) instead.
+		if (!this.secretsUnlocked) return null;
+		if (this.settings.e2eeEnabled && !this.settings.passphrase) return null;
 		const remote = this.getRemoteScan();
 		if (this.engine) return this.engine.getIndexReport(remote);
 		if (!this.settings.serverUrl) return null; // not configured yet
