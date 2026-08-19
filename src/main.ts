@@ -823,8 +823,11 @@ export default class CouchDBSyncPlugin extends Plugin {
 
 		this.setStatus(SYNC_STATE.CONNECTING, "Emptying the server…");
 		const db = this.getSharedDb();
+		let outcome: { strategy: "dropped" | "emptied"; deleted: number };
 		try {
-			await db.destroyRemote();
+			outcome = await db.resetRemote((n) =>
+				this.setStatus(SYNC_STATE.CONNECTING, `Emptying the server… ${n} documents removed`)
+			);
 		} catch (e) {
 			const err = toError(e);
 			this.setStatus(SYNC_STATE.ERROR, `Could not reset the server: ${err.message}`);
@@ -850,7 +853,14 @@ export default class CouchDBSyncPlugin extends Plugin {
 			await this.saveSettings();
 		}
 		await this.doRestart("upload");
-		new Notice("CouchDB Sync: the server now holds exactly this device's files.");
+		new Notice(
+			outcome.strategy === "dropped"
+				? "CouchDB Sync: the server database was rebuilt and now holds exactly this device's files."
+				: `CouchDB Sync: ${outcome.deleted} document(s) deleted on the server; it now holds exactly this device's files. ` +
+					"Your account may not drop databases, so deletion stubs remain — harmless, but the disk space " +
+					"comes back only when the server compacts.",
+			15000
+		);
 	}
 
 	/**

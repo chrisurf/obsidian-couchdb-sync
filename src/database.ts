@@ -637,6 +637,92 @@ export class SyncDatabase {
 	}
 
 	/**
+	 * Empty the remote, by whichever means this account is allowed.
+	 *
+	 * Dropping the database is the clean way — it reclaims the space and leaves
+	 * nothing behind — but in CouchDB 3 that is a SERVER ADMIN operation, and a
+	 * sync account is normally just a member of one database. So a refusal is an
+	 * expected outcome, not an error: fall back to deleting every document, which
+	 * needs no more rights than ordinary syncing does.
+	 *
+	 * Returns which route was taken, because the outcomes differ in a way the user
+	 * has to know about (see deleteAllRemoteDocs).
+	 */
+	async resetRemote(
+		onProgress?: (deleted: number) => void
+	): Promise<{ strategy: "dropped" | "emptied"; deleted: number }> {
+		try {
+			await this.destroyRemote();
+			return { strategy: "dropped", deleted: 0 };
+		} catch (e) {
+			const err = e as { status?: number; message?: string };
+			// 401/403 = not allowed to drop databases. Anything else (network, 404,
+			// a failed recreate) is a real failure and must not be papered over by
+			// silently deleting documents instead.
+			if (err.status !== 401 && err.status !== 403) throw e;
+		}
+		const deleted = await this.deleteAllRemoteDocs(onProgress);
+		return { strategy: "emptied", deleted };
+	}
+
+	/**
+	 * Mark every document in the remote database deleted, in batches.
+	 *
+	 * Needs only write access — the same right syncing already uses. What it leaves
+	 * behind is a deletion stub ("tombstone") per document: CouchDB keeps those on
+	 * purpose, because they are how the deletion reaches every other replica. They
+	 * carry no content and are excluded from every count the plugin shows, but the
+	 * space the old documents occupied comes back only on compaction, which is again
+	 * an admin operation. Dropping the database is therefore still the better route
+	 * where it is permitted.
+	 *
+	 * Paging walks the key space forward with `startkey` and never revisits it. Design
+	 * documents are left alone: they are not ours to delete, and they sort in the
+	 * middle of our own id ranges.
+	 */
+	async deleteAllRemoteDocs(onProgress?: (deleted: number) => void): Promise<number> {
+		const r = this.remote ?? this.connectRemote();
+		const BATCH = 200;
+		let startkey = "";
+		let deleted = 0;
+		for (;;) {
+			const page = await r.allDocs({ limit: BATCH, startkey });
+			if (page.rows.length === 0) break;
+			const last = page.rows[page.rows.length - 1].id;
+
+			const batch = page.rows
+				.filter((row) => !row.id.startsWith("_design/") && row.value.rev)
+				.map((row) => ({ _id: row.id, _rev: row.value.rev, _deleted: true }));
+
+			if (batch.length > 0) {
+				const results = await r.bulkDocs(batch as unknown as FileDoc[]);
+				const failures = results.filter((x) => "error" in x && x.error);
+				deleted += results.length - failures.length;
+				onProgress?.(deleted);
+				if (failures.length === results.length) {
+					const first = failures[0] as { reason?: string; name?: string };
+					throw new Error(
+						`Could not delete documents on the server (${first.reason ?? first.name ?? "unknown reason"}).`
+					);
+				}
+			}
+
+			if (page.rows.length < BATCH) break; // that was the last page
+			// Advance strictly past the last id we handled. NOT `skip`: the documents in
+			// this page are gone from the index the moment they are deleted, so a skip
+			// counted against the shrinking result set would step over live documents
+			// and leave them behind. A key cursor cannot: it only ever moves forward,
+			// which also guarantees this loop ends.
+			// The separator is \u0000 rather than any printable character: history ids
+			// embed a NEWLINE (HISTORY_SEP), which sorts below a space, so a cursor of
+			// `last + " "` would jump over a path's own history documents. Nothing
+			// sorts below \u0000, so nothing can be skipped.
+			startkey = last + "\u0000";
+		}
+		return deleted;
+	}
+
+	/**
 	 * Delete the REMOTE database and recreate it empty.
 	 *
 	 * Everything the server holds goes: file documents, every content chunk, and the

@@ -592,8 +592,10 @@ export class CouchDBSyncSettingTab extends PluginSettingTab {
 						"Reset the server from this device",
 						"Delete EVERYTHING on the server and replace it with this device's files. Removes " +
 							"leftovers no other action can reach — duplicate documents from an older version, " +
-							"orphaned data, the entire version history. Use this when the server state is wrong " +
-							"and this vault is the copy you trust.",
+							"orphaned data, the entire version history. Drops the whole database if your account " +
+							"is allowed to; otherwise it deletes every document instead, which needs no more " +
+							"rights than syncing. Use this when the server state is wrong and this vault is the " +
+							"copy you trust.",
 						(setting) =>
 							setting.addButton((b) =>
 								b
