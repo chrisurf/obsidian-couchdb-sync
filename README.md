@@ -146,6 +146,30 @@ That gives you `http://127.0.0.1:5984` with user `admin` and password
 `password` — perfect for trying things out on one computer. Change that password
 and use `https://` before you sync anything real over the internet.
 
+**Option C — keep your server off the open internet (Cloudflare Tunnel).** If you
+run CouchDB at home but would rather not forward a port or hand out your IP
+address, a [Cloudflare Tunnel](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/)
+puts a public hostname in front of it. `cloudflared` runs next to CouchDB and
+dials *out*, so your router needs no inbound rule, and the certificate is handled
+for you:
+
+```bash
+cloudflared tunnel create obsidian
+cloudflared tunnel route dns obsidian couch.example.com
+cloudflared tunnel run --url http://127.0.0.1:5984 obsidian
+```
+
+Then enter `https://couch.example.com` as the web address in Step 2. There is no
+setting for this in the plugin — the tunnel is invisible to it.
+
+> ⚠️ **A tunnel hides where your server is; it does not lock the door.** Anyone
+> who knows the hostname reaches your CouchDB, so `require_valid_user = true`
+> below and a strong password are what actually protect it.
+>
+> Do **not** put a Cloudflare Access policy in front of the hostname: Access
+> answers unauthenticated requests with a login page rather than your data, and
+> the plugin cannot present a service token yet. Sync would stop working.
+
 **One-time server setting.** However you got your server, open its configuration
 and add this. It lets Obsidian talk to it and allows large files:
 
