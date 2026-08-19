@@ -337,6 +337,11 @@ export class IndexPanel {
 		if (!on) return st.detail ?? "Sync is switched off for this vault.";
 
 		const s = this.plugin.settings;
+		// Locked credentials look exactly like "nothing configured" from here, so say
+		// what actually happened — the vault was copied here, or its device key is gone.
+		if (!this.plugin.secretsAreUnlocked()) {
+			return "Your stored credentials are locked on this device — unlock or re-enter them in settings.";
+		}
 		if (!s.serverUrl || !s.username) {
 			return "Not configured yet — fill in the CouchDB connection below.";
 		}
@@ -591,22 +596,54 @@ export class IndexPanel {
 
 		// the summary counts only SYNCABLE files; excluded are informational
 		const syncTotal = SYNCABLE.reduce((n, s) => n + groups[s].length, 0);
-		const pending = syncTotal - groups.synced.length;
-		const pct = syncTotal === 0 ? 100 : Math.round((groups.synced.length / syncTotal) * 100);
+		const localDone = groups.synced.length;
+
+		/**
+		 * The SECOND half of the journey: how many of those files the server actually
+		 * holds. Reconciling disk with the local replica says nothing about the server —
+		 * a file sitting in the replica, not yet shipped, is not synchronized in any
+		 * sense the user cares about. Reporting only the first half is what let the
+		 * summary go green at "112 / 112" while the line right below it still read
+		 * "10 not pushed to the server yet".
+		 *
+		 * null when there is no server scan to go on (sync off, or the server is
+		 * unreachable). We then claim nothing about the server rather than guessing.
+		 */
+		const serverSet = report.serverPaths ? new Set(report.serverPaths) : null;
+		const serverDone = serverSet
+			? SYNCABLE.reduce((n, s) => n + groups[s].filter((p) => serverSet.has(p)).length, 0)
+			: null;
+		const allDone = localDone === syncTotal && (serverDone === null || serverDone === syncTotal);
 
 		summary.className = "couchdb-sync-summary";
-		if (pending === 0) {
+		summary.empty();
+		/**
+		 * Each half goes in its own nowrap span so a narrow panel breaks BETWEEN them
+		 * rather than through "112 / 112 local". The panel is mounted both in settings
+		 * and in the sidebar, and on a phone it is narrow in either — one long line
+		 * would wrap at whatever character happened to reach the edge.
+		 */
+		const part = (text: string) => summary.createSpan({ cls: "couchdb-sync-summary-part", text });
+		if (allDone) {
 			summary.addClass("couchdb-sync-summary-ok");
-			summary.setText(`${groups.synced.length} / ${syncTotal} files in sync`);
-		} else {
+			part(`${syncTotal} / ${syncTotal} files in sync`);
+		} else if (serverDone !== null) {
+			// Both halves, each named, so it is always clear WHERE the remaining work is.
 			summary.addClass("couchdb-sync-summary-pending");
-			summary.setText(`${groups.synced.length} / ${syncTotal} files (${pct}%) · ${pending} pending`);
+			part(`${localDone} / ${syncTotal} local`);
+			part(`${serverDone} / ${syncTotal} on server`);
+		} else {
+			// No server reading available — report the half we can actually vouch for.
+			const pct = syncTotal === 0 ? 100 : Math.round((localDone / syncTotal) * 100);
+			summary.addClass("couchdb-sync-summary-pending");
+			part(`${localDone} / ${syncTotal} local (${pct}%)`);
+			part(`${syncTotal - localDone} pending`);
 		}
 		// className was just reset above, so re-apply the activity marker.
 		this.markSummaryActivity();
 
 		// ---- store cards (This device / Local cache / Server) + the two deltas ----
-		this.renderStores(counts, report);
+		this.renderStores(counts, report, serverDone !== null && serverDone === syncTotal);
 
 		// ---- status counters as small, actionable widgets ----
 		this.renderStatWidgets(groups);
@@ -698,7 +735,7 @@ export class IndexPanel {
 	}
 
 	/** The three store cards (A/B/C) followed by the two directional delta lines. */
-	private renderStores(el: HTMLElement, report: IndexReport): void {
+	private renderStores(el: HTMLElement, report: IndexReport, serverComplete: boolean): void {
 		el.empty();
 		el.className = "couchdb-sync-counts couchdb-sync-storewrap";
 		const grid = el.createDiv({ cls: "couchdb-sync-stores" });
@@ -713,7 +750,17 @@ export class IndexPanel {
 		if (report.serverReachable === false) {
 			mk("Server", "✕ " + this.serverErrShort(report.serverError), "unreachable", "couchdb-sync-store-err");
 		} else if (report.serverReachable === true) {
-			mk("Server", String(report.serverCount ?? 0), "source of truth", "couchdb-sync-store-ok");
+			// Green means one thing everywhere: done. It used to mean merely "the server
+			// answered", so the number sat there in green while the server was still
+			// missing ten files — which reads as "the server is in sync" and made the
+			// summary beside it look wrong. Reachability is what the subtitle and the
+			// error state are for.
+			mk(
+				"Server",
+				String(report.serverCount ?? 0),
+				"source of truth",
+				serverComplete ? "couchdb-sync-store-ok" : ""
+			);
 		} else {
 			mk("Server", "—", "sync off / not checked");
 		}

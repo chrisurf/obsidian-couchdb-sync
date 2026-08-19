@@ -4,12 +4,23 @@ import {
 	CouchDBSyncSettings,
 	CURRENT_SETTINGS_VERSION,
 	DEFAULT_SETTINGS,
+	SecretsMode,
 	SYNC_STATE,
 	SyncState,
 	SyncStatus,
 	VersionDoc,
 } from "./types";
 import { migrateSettings } from "./migrate";
+import {
+	clearSecretKeyCache,
+	decideSealAction,
+	DeviceKeyStore,
+	loadOrCreateDeviceKey,
+	sealSecrets,
+	toPersisted,
+	unsealSecrets,
+} from "./secrets";
+import { askNewSecretsPassphrase, askUnlockPassphrase } from "./secretsmodal";
 import { RemoteScan, SyncDatabase } from "./database";
 import { SyncEngine, IndexReport, buildIndexReport, removeFromDb } from "./engine";
 import { CouchDBSyncSettingTab } from "./settings";
@@ -105,6 +116,35 @@ export default class CouchDBSyncPlugin extends Plugin {
 	private statusIconEl!: HTMLElement;
 	private statusTextEl!: HTMLElement;
 	private restartLock: Promise<void> = Promise.resolve();
+
+	// --- credential storage (see secrets.ts) ---------------------------------
+	/** Key material that opens `encryptedSecrets`; null while locked. */
+	private secretKey: string | null = null;
+	/** The sealed blob exactly as it sits on disk. */
+	private sealedSecrets = "";
+	/**
+	 * True once the blob has been opened — or there was nothing to open (fresh vault,
+	 * or a pre-v6 config whose plaintext is still in memory waiting to be sealed).
+	 * While false, the credentials in `settings` are NOT the ones on disk, so saving
+	 * must leave the stored blob alone.
+	 */
+	private secretsUnlocked = false;
+	/** De-dupes the unlock prompt when several callers hit a locked vault at once. */
+	private unlockInFlight: Promise<boolean> | null = null;
+	/** The user dismissed the unlock prompt; automatic paths stop re-asking. */
+	private unlockPromptDeclined = false;
+	/**
+	 * Device-local key store. Obsidian scopes this storage per vault and keeps it
+	 * outside the vault folder, which is the whole point: copying, backing up or
+	 * syncing the vault does not carry the key with it.
+	 */
+	private deviceStore: DeviceKeyStore = {
+		get: (key) => {
+			const raw: unknown = this.app.loadLocalStorage(key);
+			return typeof raw === "string" && raw.length > 0 ? raw : null;
+		},
+		set: (key, value) => this.app.saveLocalStorage(key, value),
+	};
 
 	/** Latest status, shared with the settings view via listeners. */
 	status: SyncStatus = { state: SYNC_STATE.IDLE };
@@ -342,6 +382,10 @@ export default class CouchDBSyncPlugin extends Plugin {
 		this.settings.unsafeShutdown = false;
 		this.settings.unsafeShutdownStreak = 0;
 		await this.saveSettings().catch(() => undefined);
+		// Drop the derived credential key. In "ask" mode the passphrase must never
+		// outlive the session that asked for it.
+		clearSecretKeyCache();
+		this.secretKey = null;
 	}
 
 	private setStatus(state: SyncState, detail?: string): void {
@@ -361,6 +405,12 @@ export default class CouchDBSyncPlugin extends Plugin {
 		// Just settled? Refresh the drift summary so the bar can flip from a %
 		// to the checkmark immediately, without waiting for the periodic tick.
 		if (wasSyncing && state === SYNC_STATE.SYNCED) {
+			// Drop the cached server reading first. It is throttled to 15 s, which is
+			// right while nothing is happening but wrong at exactly this moment: work
+			// just finished, so the last reading is the stalest it will ever be, and the
+			// summary would report the server as behind for up to another 15 seconds
+			// after it had caught up.
+			this.remoteScan = null;
 			void this.refreshDriftSummary();
 		}
 	}
@@ -436,9 +486,26 @@ export default class CouchDBSyncPlugin extends Plugin {
 			if (!report) {
 				this.effectiveDrift = null;
 			} else {
-				const drift = report.localOnly.length + report.dbOnly.length + report.drift.length;
-				const total = report.inSync.length + drift;
-				const pct = total === 0 ? 100 : Math.round((report.inSync.length / total) * 100);
+				// Everything that is NOT yet the same everywhere. Counted as a set of paths
+				// because the categories overlap — a drifting file can also be one the
+				// server has not seen — and summing the lengths would count it twice.
+				//
+				// notPushed and serverOnly belong in here: the status bar used to consider
+				// only disk-versus-replica, so its checkmark appeared while files were still
+				// queued for the server, disagreeing with the panel that reported them
+				// pending. Conflicts likewise — a conflicted file is not "in sync".
+				const behind = new Set<string>([
+					...report.localOnly,
+					...report.dbOnly,
+					...report.drift,
+					...report.conflicts,
+					...(report.notPushed ?? []),
+					...(report.serverOnly ?? []),
+				]);
+				const settled = report.inSync.filter((p) => !behind.has(p));
+				const drift = behind.size;
+				const total = settled.length + drift;
+				const pct = total === 0 ? 100 : Math.round((settled.length / total) * 100);
 				this.effectiveDrift = { drift, pct };
 
 				// Idle auto-resolve: when no session is running but the DB still holds
@@ -555,6 +622,18 @@ export default class CouchDBSyncPlugin extends Plugin {
 		// Keep the shared local DB handle OPEN across restarts (see getSharedDb): the
 		// engine and idle readers share ONE handle, so it must never be closed here.
 
+		// Credentials must be readable before anything touches the network. This is the
+		// one place that prompts in "ask" mode (every start path funnels through here),
+		// and the one place that stops a locked device from replicating with empty
+		// credentials — which would look like a wrong passphrase to the user.
+		if (!this.secretsUnlocked && !(await this.ensureSecretsUnlocked())) {
+			this.setStatus(
+				SYNC_STATE.ERROR,
+				"Your stored credentials are locked on this device. Unlock them (or re-enter them) in settings."
+			);
+			return;
+		}
+
 		if (!this.settings.serverUrl || !this.settings.username) {
 			this.setStatus(SYNC_STATE.IDLE);
 			new Notice("CouchDB Sync: please configure the server connection in settings.");
@@ -653,6 +732,10 @@ export default class CouchDBSyncPlugin extends Plugin {
 		// A changed remote invalidates the cached server scan too, so the Server column
 		// never shows the previous server's state after the URL/db/user is edited.
 		this.remoteScan = null;
+		// …and the cached remote HANDLE, which carries the old credentials baked in
+		// (see SyncDatabase.closeRemote). Keeping it meant every later automatic scan
+		// re-authenticated with the password the user just replaced.
+		this.db?.closeRemote();
 		if (!this.settings.connectionVerified) return;
 		this.settings.connectionVerified = false;
 		await this.saveSettings();
@@ -712,6 +795,131 @@ export default class CouchDBSyncPlugin extends Plugin {
 				);
 			});
 		return this.restartLock;
+	}
+
+	/**
+	 * Make the server an exact copy of THIS device: delete the remote database, wipe
+	 * the local replica, and upload every file on disk into the fresh database.
+	 *
+	 * Three steps in one action because doing any two of them is worse than doing all
+	 * three. Emptying the server alone accomplishes nothing: the local replica still
+	 * holds every document that was just deleted and pushes them straight back. And
+	 * wiping the replica without emptying the server would simply download the old
+	 * state again. Only the whole sequence produces "what is on this disk is what is
+	 * on the server, and nothing else".
+	 *
+	 * This is how a vault recovers from residue no per-file action can reach —
+	 * documents left behind by an older id scheme, orphaned chunks, a history that
+	 * has grown past its worth.
+	 *
+	 * NOT a substitute for coordination: every OTHER device still holds a replica of
+	 * the deleted database and will push it back the moment it syncs. Those devices
+	 * must wipe their local cache before they reconnect. The confirmation dialog says
+	 * so; there is nothing this device can do to enforce it.
+	 */
+	async resetServerFromLocal(): Promise<void> {
+		this.engine?.abort();
+		this.restartLock = this.restartLock
+			.catch(() => undefined)
+			.then(() => this.doServerReset());
+		const emptied = await this.restartLock.then(
+			() => this.resetEmptiedServer,
+			() => false
+		);
+		if (!emptied) return; // it failed and said why; do not start a session on top
+
+		// Start the upload as its OWN restart, after the reset's lock segment has been
+		// released — not from inside it. Kicked off in there, the upload ran as a
+		// detached task while the lock it was started from was still held; anything that
+		// aborted the engine in that window (a recovery restart, a queued action) made
+		// startUploadOnly return silently, and the reset finished having emptied the
+		// server and uploaded nothing. Going through restartSync is also the path the
+		// user's own "Force sync" takes, which is the one this has to match.
+		await this.restartSync();
+	}
+
+	/** Whether the last doServerReset actually emptied the server (drives the restart). */
+	private resetEmptiedServer = false;
+
+	private async doServerReset(): Promise<void> {
+		this.resetEmptiedServer = false; // set only once the server is actually empty
+		if (!this.secretsUnlocked && !(await this.ensureSecretsUnlocked())) {
+			this.setStatus(SYNC_STATE.ERROR, "Credentials are locked — unlock them first.");
+			return;
+		}
+		if (!this.settings.serverUrl || !this.settings.username) {
+			new Notice("CouchDB Sync: configure the server connection first.");
+			return;
+		}
+		if (this.settings.e2eeEnabled && !this.settings.passphrase) {
+			new Notice("CouchDB Sync: set the encryption passphrase first — the upload needs it.");
+			return;
+		}
+
+		this.engine?.stop();
+		this.engine = null;
+		if (this.reportInFlight) await this.reportInFlight.catch(() => undefined);
+		this.remoteScan = null;
+
+		this.setStatus(SYNC_STATE.CONNECTING, "Emptying the server…");
+		const db = this.getSharedDb();
+		let outcome: { strategy: "dropped" | "emptied"; deleted: number };
+		try {
+			outcome = await db.resetRemote((n) =>
+				this.setStatus(SYNC_STATE.CONNECTING, `Emptying the server… ${n} documents removed`)
+			);
+		} catch (e) {
+			const err = toError(e);
+			this.setStatus(SYNC_STATE.ERROR, `Could not reset the server: ${err.message}`);
+			new Notice(`CouchDB Sync: ${err.message}`, 15000);
+			// The local replica is deliberately NOT wiped here. Whether the delete failed
+			// outright or the recreate did, this replica is the only remaining copy of
+			// what the server held — throwing it away on the error path would turn a
+			// recoverable failure into real data loss.
+			return;
+		}
+
+		// The replica mirrors what we just deleted, so it has to go too — otherwise the
+		// upload below would re-push every document the reset was meant to remove.
+		//
+		// It is replaced by a replica under a NEW name rather than destroyed in place.
+		// IndexedDB finishes a deleteDatabase only once every connection to it has
+		// closed, so a handle opened moments later on the same name can be wiped out
+		// from underneath the upload that follows. That is not theoretical: it emptied
+		// the server, uploaded nothing, and reported success — every write hit a closing
+		// connection, which fail() classifies as the recoverable "IDB closing" case and
+		// logs at debug level, so it did not even leave a visible trace. A fresh name has
+		// no connections to wait for and cannot be raced.
+		const stale = this.db;
+		const previousDbId = this.settings.localDbId;
+		this.settings.localDbId = generateDeviceId();
+		console.debug(
+			`[couchdb-sync] reset: local replica ${previousDbId} -> ${this.settings.localDbId}`
+		);
+		await this.saveSettings();
+		this.db = null;
+		this.reportInFlight = null;
+		// The old replica is now unreachable; clearing it is housekeeping, and a failure
+		// costs disk space rather than correctness.
+		void stale?.destroyLocal().catch(() => undefined);
+
+		// Sync must be ON for the upload to run at all (doRestart's master switch), so a
+		// reset from a switched-off vault turns it on — the user just asked for an upload.
+		if (!this.settings.syncEnabled) {
+			this.settings.syncEnabled = true;
+			await this.saveSettings();
+		}
+		// The upload itself is started by the caller, once this lock segment is released.
+		this.setStatus(SYNC_STATE.IDLE, "Server emptied — uploading this device's files…");
+		this.resetEmptiedServer = true;
+		new Notice(
+			outcome.strategy === "dropped"
+				? "CouchDB Sync: the server database was rebuilt; now uploading this device's files."
+				: `CouchDB Sync: ${outcome.deleted} document(s) deleted on the server; now uploading this device's files. ` +
+					"Your account may not drop databases, so deletion stubs remain — harmless, but the disk space " +
+					"comes back only when the server compacts.",
+			15000
+		);
 	}
 
 	/**
@@ -839,6 +1047,12 @@ export default class CouchDBSyncPlugin extends Plugin {
 		// immediately and refreshes in the background — the local report must never wait
 		// on a network round-trip, so an unreachable server just leaves the Server column
 		// blank until the next refresh, instead of stalling the whole panel.
+		// Every file doc is decrypted to build this report, so without a usable
+		// passphrase there is nothing to report — only a scan that fails on every
+		// document. Bail out and let the status card explain the real reason (locked
+		// credentials, or no passphrase set yet) instead.
+		if (!this.secretsUnlocked) return null;
+		if (this.settings.e2eeEnabled && !this.settings.passphrase) return null;
 		const remote = this.getRemoteScan();
 		if (this.engine) return this.engine.getIndexReport(remote);
 		if (!this.settings.serverUrl) return null; // not configured yet
@@ -872,6 +1086,10 @@ export default class CouchDBSyncPlugin extends Plugin {
 		if (!this.settings.syncEnabled || !this.settings.serverUrl || !this.settings.connectionVerified) {
 			return undefined;
 		}
+		// Locked credentials mean the password in `settings` is empty. Probing on a
+		// timer with that is a stream of failed logins, which is exactly what gets a
+		// throttling server to lock the account — so touch no network until unlocked.
+		if (!this.secretsUnlocked) return undefined;
 		const now = Date.now();
 		const fresh = this.remoteScan && now - this.remoteScan.at < REMOTE_SCAN_TTL_MS;
 		if (!fresh && !this.remoteScanInFlight) {
@@ -1096,7 +1314,198 @@ export default class CouchDBSyncPlugin extends Plugin {
 			this.settings.localDbId = generateDeviceId();
 			dirty = true;
 		}
+
+		// Credentials: everything above merged the PERSISTED shape, in which the two
+		// secrets are absent (v6+) or plaintext leftovers (pre-v6). Open the sealed blob
+		// so the rest of the plugin sees the same live `settings.password` /
+		// `settings.passphrase` it always has.
+		this.sealedSecrets =
+			typeof this.settings.encryptedSecrets === "string" ? this.settings.encryptedSecrets : "";
+		await this.openSecrets();
+		// A pre-v6 config arrives with plaintext credentials in `loaded`; the save below
+		// (dirty is set by the schema bump) is what seals them and drops the plain keys.
 		if (dirty) await this.saveSettings();
+	}
+
+	/**
+	 * Unlock the stored credentials at load time.
+	 *
+	 * "device" mode succeeds silently — the key is generated on first use, so a fresh
+	 * install never prompts. It fails only when the vault (and with it `data.json`) was
+	 * copied from another device or its local storage was cleared; then the blob stays
+	 * unreadable and we deliberately stay locked rather than guess.
+	 *
+	 * "ask" mode cannot be resolved here at all: `onload` runs before the workspace is
+	 * ready and a modal at that point fights with Obsidian for the screen. It stays
+	 * locked until `ensureSecretsUnlocked()` prompts once the layout is up.
+	 */
+	private async openSecrets(): Promise<void> {
+		this.secretKey = null;
+		this.secretsUnlocked = false;
+
+		if (this.settings.secretsMode === "ask") {
+			// Stays locked either way: with a blob, `ensureSecretsUnlocked` asks for the
+			// passphrase that opens it; without one (only reachable via a hand-edited
+			// data.json, since switching to this mode always writes a blob) it asks for a
+			// fresh passphrase instead. Reporting "unlocked" here would be worse than
+			// useless — there would be no key to seal anything typed afterwards with, and
+			// the credentials would vanish on the next launch.
+			return;
+		}
+
+		const key = loadOrCreateDeviceKey(this.deviceStore);
+		if (!key) {
+			// No device storage means no key we could ever read back — staying locked
+			// keeps the credentials off the disk instead of writing them unprotected.
+			console.warn("[couchdb-sync] no device key store available; credentials stay locked");
+			return;
+		}
+		this.secretKey = key;
+		if (!this.sealedSecrets) {
+			// Fresh vault, or a pre-v6 config whose plaintext credentials are already in
+			// `settings` — either way there is nothing to open and saving may seal.
+			this.secretsUnlocked = true;
+			return;
+		}
+		const opened = await unsealSecrets(this.sealedSecrets, key);
+		if (!opened) return; // wrong/absent key: locked, blob preserved
+		this.settings.password = opened.password;
+		this.settings.passphrase = opened.passphrase;
+		this.secretsUnlocked = true;
+	}
+
+	/** Are the stored credentials readable on this device right now? */
+	secretsAreUnlocked(): boolean {
+		return this.secretsUnlocked;
+	}
+
+	/** Are there actual credentials behind the seal (as opposed to an empty one)? */
+	hasStoredSecrets(): boolean {
+		if (!this.sealedSecrets) return false;
+		if (!this.secretsUnlocked) return true; // sealed but unreadable — something is in there
+		return !!(this.settings.password || this.settings.passphrase);
+	}
+
+	/**
+	 * Make sure the credentials are readable, prompting once in "ask" mode. Concurrent
+	 * callers share the single in-flight prompt so a mobile resume plus a Force sync
+	 * cannot stack two modals. Returns false when the vault stays locked.
+	 *
+	 * A cancelled prompt is remembered: automatic paths (launch, mobile resume
+	 * recovery, a queued restart) then stop asking, so dismissing the dialog once does
+	 * not turn every background restart into another modal. `force` — the explicit
+	 * Unlock button — clears that and asks again.
+	 */
+	async ensureSecretsUnlocked(force = false): Promise<boolean> {
+		if (this.secretsUnlocked) return true;
+		if (this.settings.secretsMode !== "ask") return false; // no prompt can fix a bad device key
+		if (force) this.unlockPromptDeclined = false;
+		else if (this.unlockPromptDeclined) return false;
+		if (this.unlockInFlight) return this.unlockInFlight;
+
+		const attempt = async (): Promise<boolean> => {
+			// Nothing sealed to open: ask for a passphrase to protect the credentials
+			// from here on, so the mode repairs itself instead of dead-ending.
+			if (!this.sealedSecrets) {
+				const chosen = await askNewSecretsPassphrase(this.app);
+				if (!chosen) {
+					this.unlockPromptDeclined = true;
+					return false;
+				}
+				this.secretKey = chosen;
+				this.secretsUnlocked = true;
+				await this.saveSettings();
+				return true;
+			}
+			const entered = await askUnlockPassphrase(this.app);
+			if (!entered) {
+				this.unlockPromptDeclined = true;
+				return false;
+			}
+			const opened = await unsealSecrets(this.sealedSecrets, entered);
+			if (!opened) {
+				new Notice("CouchDB Sync: that passphrase does not unlock the stored credentials.");
+				return false;
+			}
+			this.secretKey = entered;
+			this.settings.password = opened.password;
+			this.settings.passphrase = opened.passphrase;
+			this.secretsUnlocked = true;
+			// Anything built while locked carries an empty password — throw it away so
+			// the first request after unlocking uses the real credentials.
+			this.db?.closeRemote();
+			return true;
+		};
+
+		this.unlockInFlight = attempt();
+		try {
+			return await this.unlockInFlight;
+		} finally {
+			this.unlockInFlight = null;
+		}
+	}
+
+	/**
+	 * Give up on an unreadable blob and start over on this device: discard it, take a
+	 * fresh key, and leave the credential fields empty and editable again.
+	 *
+	 * This is the way out of the one state the user cannot otherwise leave — locked in
+	 * "ask" mode with the passphrase forgotten, where there is no key to seal newly
+	 * typed credentials with, so anything entered would be silently dropped on the next
+	 * launch. Nothing on the server is touched; only this device's stored copy of the
+	 * credentials goes away, and the user re-enters them.
+	 */
+	async resetStoredSecrets(): Promise<boolean> {
+		if (this.settings.secretsMode === "ask") {
+			const chosen = await askNewSecretsPassphrase(this.app);
+			if (!chosen) return false;
+			this.secretKey = chosen;
+		} else {
+			const key = loadOrCreateDeviceKey(this.deviceStore);
+			if (!key) {
+				new Notice("CouchDB Sync: this device cannot store a key for your credentials.");
+				return false;
+			}
+			this.secretKey = key;
+		}
+		this.settings.password = "";
+		this.settings.passphrase = "";
+		this.sealedSecrets = "";
+		this.secretsUnlocked = true;
+		this.unlockPromptDeclined = false;
+		await this.saveSettings();
+		return true;
+	}
+
+	/**
+	 * Switch where the credential key comes from. Requires the credentials to be
+	 * readable first — re-sealing a blob we cannot open would throw away the password
+	 * and the passphrase behind it. Returns false when the change did not happen.
+	 */
+	async setSecretsMode(mode: SecretsMode): Promise<boolean> {
+		if (mode === this.settings.secretsMode) return true;
+		if (!(await this.ensureSecretsUnlocked(true))) {
+			new Notice("CouchDB Sync: unlock your stored credentials before changing how they are kept.");
+			return false;
+		}
+		if (mode === "ask") {
+			const chosen = await askNewSecretsPassphrase(this.app);
+			if (!chosen) return false;
+			this.secretKey = chosen;
+		} else {
+			const key = loadOrCreateDeviceKey(this.deviceStore);
+			if (!key) {
+				new Notice("CouchDB Sync: this device cannot store a key; keeping the current setting.");
+				return false;
+			}
+			this.secretKey = key;
+		}
+		this.settings.secretsMode = mode;
+		this.secretsUnlocked = true;
+		// Re-seal immediately under the new key, so the blob on disk and the mode that
+		// describes how to open it are never out of step.
+		await this.saveSettings();
+		return true;
 	}
 
 	/**
@@ -1137,7 +1546,44 @@ export default class CouchDBSyncPlugin extends Plugin {
 		}
 	}
 
+	/**
+	 * Persist the settings with the credentials sealed (see secrets.ts). The live
+	 * `settings.password` / `settings.passphrase` are left untouched — the rest of the
+	 * plugin keeps reading them exactly as before; only the copy that goes to
+	 * `data.json` has them replaced by the encrypted blob.
+	 */
 	async saveSettings(): Promise<void> {
-		await this.saveData(this.settings);
+		const blob = await this.sealForDisk();
+		this.settings.encryptedSecrets = blob; // keep the in-memory view honest
+		await this.saveData(toPersisted(this.settings, blob));
+	}
+
+	/**
+	 * The blob to write — a fresh seal, or the stored one passed through untouched.
+	 * `decideSealAction` owns that call (and documents why it matters).
+	 */
+	private async sealForDisk(): Promise<string> {
+		const key = this.secretKey;
+		const action = decideSealAction({
+			key,
+			unlocked: this.secretsUnlocked,
+			password: this.settings.password,
+			passphrase: this.settings.passphrase,
+		});
+		if (action === "keep" || !key) return this.sealedSecrets;
+		try {
+			const blob = await sealSecrets(
+				{ password: this.settings.password, passphrase: this.settings.passphrase },
+				key
+			);
+			this.sealedSecrets = blob;
+			// Re-entering credentials over an unreadable blob is a legitimate recovery,
+			// and it leaves the vault unlocked again.
+			this.secretsUnlocked = true;
+			return blob;
+		} catch (e) {
+			console.error("[couchdb-sync] could not seal credentials", e);
+			return this.sealedSecrets;
+		}
 	}
 }

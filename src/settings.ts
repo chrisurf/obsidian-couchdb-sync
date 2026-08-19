@@ -115,6 +115,16 @@ export class CouchDBSyncSettingTab extends PluginSettingTab {
 		});
 
 		// --- connection & encryption validity (drives the collapsible section) ---
+		/**
+		 * "ask" mode with the vault still locked: there is no key to seal anything with,
+		 * so a password typed here could not be persisted. The fields are held shut until
+		 * the user either unlocks or starts over, instead of quietly discarding input.
+		 * A locked DEVICE-mode vault has a key (a fresh one), so typing works there and
+		 * simply replaces the unreadable blob.
+		 */
+		const credsLocked = () =>
+			!this.plugin.secretsAreUnlocked() && this.plugin.settings.secretsMode === "ask";
+
 		const connOk = () => s.connectionVerified;
 		const passStatus = () => this.plugin.passphraseStatus(); // "empty" | "mismatch" | "ok"
 		const encOk = () => passStatus() === "ok";
@@ -187,6 +197,13 @@ export class CouchDBSyncSettingTab extends PluginSettingTab {
 							setting.settingEl.empty();
 							setting.settingEl.addClass("couchdb-sync-conn-bannerhost");
 							const problems: string[] = [];
+							if (!this.plugin.secretsAreUnlocked()) {
+								problems.push(
+									this.plugin.settings.secretsMode === "ask"
+										? "Your stored credentials are locked — enter their passphrase under “Credential storage”."
+										: "Your stored credentials cannot be read on this device (the vault was copied here, or this device's key is gone). Enter them again below."
+								);
+							}
 							if (!connOk()) {
 								problems.push(
 									"Server connection not verified — fill in the details below and press “Test connection”."
@@ -253,6 +270,7 @@ export class CouchDBSyncSettingTab extends PluginSettingTab {
 						setting.addText((t) => {
 							input = t.inputEl;
 							t.inputEl.type = "password"; // masked by default
+							t.setDisabled(credsLocked());
 							t.setValue(s.password).onChange(async (v) => {
 								s.password = v;
 								await this.plugin.saveSettings();
@@ -266,7 +284,9 @@ export class CouchDBSyncSettingTab extends PluginSettingTab {
 						"Check the server URL, database and credentials. On success this unlocks the Index status view; if the passphrase also checks out, this section collapses.",
 						(setting) =>
 							setting.addButton((b) =>
-								b.setButtonText("Test").onClick(async () => {
+								// Locked credentials would make this probe the server with an empty
+								// password and report a bogus "wrong login".
+								b.setDisabled(credsLocked()).setButtonText("Test").onClick(async () => {
 									const db = new SyncDatabase(s, "couchdb-sync-test-probe");
 									const res = await db.testConnection();
 									new Notice(res.message, res.ok ? 4000 : 8000);
@@ -295,6 +315,7 @@ export class CouchDBSyncSettingTab extends PluginSettingTab {
 							setting.addText((t) => {
 								input = t.inputEl;
 								t.inputEl.type = "password"; // masked by default
+								t.setDisabled(credsLocked());
 								t.setValue(s.passphrase).onChange(async (v) => {
 									s.passphrase = v;
 									await this.plugin.saveSettings();
@@ -302,7 +323,7 @@ export class CouchDBSyncSettingTab extends PluginSettingTab {
 							});
 							this.addRevealButton(setting, () => input);
 							setting.addButton((b) =>
-								b.setButtonText("Verify").onClick(async () => {
+								b.setDisabled(credsLocked()).setButtonText("Verify").onClick(async () => {
 									if (!s.passphrase) {
 										new Notice("Passphrase is empty.");
 										return;
@@ -327,6 +348,105 @@ export class CouchDBSyncSettingTab extends PluginSettingTab {
 							);
 						}
 					),
+				],
+			},
+
+			// --- Credential storage ---
+			// Your password and passphrase are never written to data.json in the clear;
+			// this section only decides where the key that protects them comes from.
+			{
+				type: "group",
+				heading: "Credential storage",
+				items: [
+					row(
+						"Where credentials are kept",
+						"Your CouchDB password and encryption passphrase are stored encrypted inside this vault — " +
+							"never in plain text. Choose what unlocks them: a key kept on this device only (no prompt, " +
+							"and a copied vault arrives without usable credentials), or a passphrase you type once per launch.",
+						(setting) =>
+							setting.addDropdown((d) =>
+								d
+									.addOption("device", "This device (no prompt)")
+									.addOption("ask", "Ask a passphrase at every launch")
+									.setValue(s.secretsMode)
+									.onChange(async (v) => {
+										// setSecretsMode re-seals under the new key and saves; on
+										// cancel/failure nothing changed, and the re-render puts the
+										// dropdown back where it was.
+										await this.plugin.setSecretsMode(v as typeof s.secretsMode);
+										this.update();
+									})
+							)
+					),
+					row(
+						"Unlock credentials",
+						"Enter the passphrase that protects the stored credentials to start syncing on this device.",
+						(setting) =>
+							setting.addButton((b) =>
+								b
+									.setCta()
+									.setButtonText("Unlock")
+									.onClick(async () => {
+										if (await this.plugin.ensureSecretsUnlocked(true)) {
+											new Notice("Credentials unlocked.");
+											await this.plugin.restartSync();
+										}
+										this.update();
+									})
+							),
+						{
+							visible: () =>
+								!this.plugin.secretsAreUnlocked() && this.plugin.settings.secretsMode === "ask",
+						}
+					),
+					row(
+						"Re-enter credentials",
+						"Forgot the passphrase, or moved this vault from another device? Discard the stored " +
+							"credentials on THIS device and type them in again. Your notes and the server are not touched.",
+						(setting) =>
+							setting.addButton((b) =>
+								b
+									.setDestructive()
+									.setButtonText("Start over")
+									.onClick(() => {
+										confirm(this.app, {
+											title: "Discard the stored credentials?",
+											body:
+												"This device forgets the saved server password and encryption passphrase " +
+												"so you can enter them again. Nothing on the server changes — but if you " +
+												"do not know your encryption passphrase, the notes already on the server " +
+												"cannot be read without it.",
+											cta: "Start over",
+											danger: true,
+											onConfirm: async () => {
+												if (await this.plugin.resetStoredSecrets()) {
+													this.editConnection = true; // reveal the (now empty) fields
+													new Notice("Stored credentials cleared — please enter them again.");
+												}
+												this.update();
+											},
+										});
+									})
+							),
+						{ visible: () => !this.plugin.secretsAreUnlocked() }
+					),
+					{
+						name: "Credential storage status",
+						searchable: false,
+						render: (setting) => {
+							setting.settingEl.empty();
+							setting.settingEl.addClass("setting-item-description");
+							const unlocked = this.plugin.secretsAreUnlocked();
+							const stored = this.plugin.hasStoredSecrets();
+							setting.settingEl.setText(
+								!unlocked
+									? "Locked — the stored credentials cannot be read on this device."
+									: stored
+										? "Unlocked — credentials are stored encrypted; data.json holds no readable password."
+										: "No credentials stored yet."
+							);
+						},
+					},
 				],
 			},
 
@@ -463,6 +583,42 @@ export class CouchDBSyncSettingTab extends PluginSettingTab {
 											onConfirm: async () => {
 												new Notice("Uploading to server…");
 												await this.plugin.uploadToServer();
+											},
+										});
+									})
+							)
+					),
+					row(
+						"Reset the server from this device",
+						"Delete EVERYTHING on the server and replace it with this device's files. Removes " +
+							"leftovers no other action can reach — duplicate documents from an older version, " +
+							"orphaned data, the entire version history. Drops the whole database if your account " +
+							"is allowed to; otherwise it deletes every document instead, which needs no more " +
+							"rights than syncing. Use this when the server state is wrong and this vault is the " +
+							"copy you trust.",
+						(setting) =>
+							setting.addButton((b) =>
+								b
+									.setDestructive()
+									.setButtonText("Reset server")
+									.onClick(() => {
+										confirm(this.app, {
+											title: "Delete everything on the server?",
+											body:
+												"The database on the server is deleted and rebuilt from this device: " +
+												`${this.plugin.settings.dbName} on ${this.plugin.settings.serverUrl}.\n\n` +
+												"Gone for good: every file version in the history, and anything that " +
+												"exists ONLY on the server (files no longer on this device are not " +
+												"restored). Your notes on this device are not touched.\n\n" +
+												"Every other device still holds a copy of the old database and will " +
+												"push it back when it syncs. On each of them: switch sync off now, " +
+												"and run “Wipe local cache” before switching it on again.",
+											cta: "Delete and re-upload",
+											danger: true,
+											onConfirm: async () => {
+												new Notice("Emptying the server and re-uploading…");
+												await this.plugin.resetServerFromLocal();
+												this.update();
 											},
 										});
 									})

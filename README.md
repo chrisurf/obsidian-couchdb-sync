@@ -245,6 +245,7 @@ Available from Obsidian's command palette (`Ctrl/Cmd + P`).
 | Username / Password | _(empty)_ | Your login for the server |
 | Test connection | — | Checks all of the above, and unlocks the status view |
 | Encryption passphrase | _(empty)_ | **Required.** Notes are always end-to-end encrypted (AES-256-GCM); use the same passphrase on every device |
+| Where credentials are kept | this device | What unlocks the encrypted password/passphrase in `data.json`: a key held on this device only, or a passphrase asked at every launch |
 | Conflict strategy | newest wins | Who wins when two devices edit the same note |
 | This device is the master | off | With *master wins*: this device's version always wins. Turn on for exactly one device |
 | Sync hidden files | off | Also sync `.obsidian` (your settings, themes, plugins), `.git`, etc. |
@@ -276,10 +277,21 @@ title, a folder, or a word you wrote.
 paths, sizes, fingerprints) so the status panel can work offline. Use **Wipe
 local cache** any time you want that removed; it only ever touches this device.
 
-**Your credentials** — your server password and your passphrase are stored in
-plain text in the plugin's own `data.json` file inside your vault, exactly as
-with every Obsidian plugin that holds a login. That file is never synced. Keep
-your disk encrypted, and change your credentials if the file was ever exposed.
+**Your credentials** — your server password and your encryption passphrase are
+stored **encrypted** in the plugin's own `data.json` inside your vault; that file
+holds no readable password. What unlocks them stays out of the vault, so copying,
+backing up or file-syncing the vault does not carry the key along. Two choices,
+under **Settings → Credential storage**:
+
+- **This device** (default) — a random key generated on first use and kept in this
+  device's local storage. No prompt, ever. A vault copied to another device
+  therefore arrives without usable credentials: enter them once there.
+- **Ask a passphrase at every launch** — the key is a passphrase you type once per
+  session and that is stored nowhere at all.
+
+Either way the credentials never leave your device and are never sent to the
+server. If you upgraded from an older version, the plaintext is replaced the first
+time the settings are saved — but older *backups* of `data.json` still contain it.
 
 **Where things go** — only to the server you configured yourself. Nothing is
 sent anywhere else, ever. With sync switched off, the plugin makes no network

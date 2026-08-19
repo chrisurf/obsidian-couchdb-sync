@@ -812,8 +812,12 @@ export class SyncEngine {
 		if (this.aborted) return;
 		void (async () => {
 			await this.cleanupTempFiles();
-			await this.uploadOnce();
-			if (!this.aborted) {
+			const uploaded = await this.uploadOnce();
+			// Only claim success for a pass that actually finished. Settling to SYNCED
+			// regardless is how a run that uploaded nothing still reported "In sync"
+			// beside its own "112 pending" — fail() has already set the honest state
+			// (an error, or "reconnecting" for a closed local connection), so leave it.
+			if (!this.aborted && uploaded) {
 				this.onReady();
 				// The forced one-shot pass is done. Hand back to continuous live sync so
 				// later edits keep propagating instead of the engine sitting inert while the
@@ -825,7 +829,8 @@ export class SyncEngine {
 		})();
 	}
 
-	private async uploadOnce(): Promise<void> {
+	/** Returns whether the pass completed; false means fail() has set the state. */
+	private async uploadOnce(): Promise<boolean> {
 		const remote = this.db.remote ?? this.db.connectRemote();
 		this.markActivity();
 		const opts = { batch_size: 25, batches_limit: 2 };
@@ -852,8 +857,10 @@ export class SyncEngine {
 			this.oneShot = null;
 			await this.resolveConflicts();
 			await this.persistSyncState();
+			return true;
 		} catch (e) {
 			this.fail("upload", e);
+			return false;
 		}
 	}
 
@@ -871,15 +878,38 @@ export class SyncEngine {
 			.getFiles()
 			.filter((f) => !this.skip(f.path))
 			.sort((a, b) => a.stat.size - b.stat.size); // fewest chunks first
+		// Counted and reported at the end. "Uploaded nothing, reported success" has three
+		// possible causes that look identical from outside — no files considered, every
+		// file adopted as already-identical, or every push failing into fail() (which
+		// logs the recoverable class at debug level, i.e. invisibly). Without this line
+		// they cannot be told apart from the outside.
+		let written = 0;
+		let adopted = 0;
+		let failed = 0;
 		for (const file of todo) {
 			if (this.aborted) return;
 			this.lastHash.delete(file.path);
 			try {
-				if (await this.pushFile(file)) this.markActivity();
+				if (await this.pushFile(file)) {
+					written++;
+					this.markActivity();
+				} else {
+					adopted++;
+				}
 			} catch (e) {
+				failed++;
 				this.fail(`uploading ${file.path}`, e);
 			}
 			await this.yieldToUi();
+		}
+		const summary = `[couchdb-sync] upload pass: ${todo.length} file(s) considered — ${written} written, ${adopted} unchanged/adopted, ${failed} failed`;
+		// Warn only when the outcome deserves attention: something failed, or a pass with
+		// files to consider moved nothing at all. A normal pass stays at debug level so
+		// this does not become the console noise the plugin guidelines warn about.
+		if (failed > 0 || (todo.length > 0 && written === 0 && adopted === 0)) {
+			console.warn(summary);
+		} else {
+			console.debug(summary);
 		}
 		if (this.settings.syncHidden) {
 			const adapter = this.app.vault.adapter;

@@ -8,12 +8,72 @@
 	border-radius: 8px;
 	padding: 0.8em 1em;
 	margin-bottom: 1em;
+	/* Lets the summary below react to the CARD's width rather than the viewport's. */
+	container-type: inline-size;
+	container-name: couchdb-sync-card;
 }
 
 .couchdb-sync-summary {
 	font-weight: 600;
 	font-size: var(--font-ui-small);
 	margin-top: 0.3em;
+	/*
+	 * The summary reports both halves of a sync ("112 / 112 local · 102 / 112 on
+	 * server"), which is too long for a phone. Each half is a nowrap span, so the
+	 * line breaks BETWEEN them instead of through a figure; flex-wrap then stacks
+	 * them. Wrapping is driven by the available width alone — the panel is mounted
+	 * in the settings tab AND in the sidebar, so "narrow" is not the same thing as
+	 * "mobile" and a viewport media query would get it wrong in both directions.
+	 */
+	display: flex;
+	flex-wrap: wrap;
+}
+
+.couchdb-sync-summary-part {
+	white-space: nowrap;
+}
+
+/*
+ * Spacing as a margin rather than the flex container's column-gap: stylelint's
+ * browser-support rule reads `column-gap` as the multicolumn property and warns,
+ * and a trailing margin on a wrapped line is invisible anyway — so this is the
+ * same result without the false positive.
+ */
+.couchdb-sync-summary-part:not(:last-child) {
+	margin-right: 0.45em;
+}
+
+/*
+ * The separator belongs to the half BEFORE it, so it can never be orphaned onto
+ * the start of a wrapped line. It is dropped once the halves are stacked, where a
+ * trailing "·" would just dangle — see the container query below.
+ */
+.couchdb-sync-summary-part:not(:last-child)::after {
+	content: " ·";
+}
+
+/*
+ * Once the halves are stacked, that trailing separator would dangle at the end of
+ * the first line, so it goes.
+ *
+ * The threshold is measured, not guessed: the halves stack below a card width of
+ * ~250px with three-digit counts and ~270px with four-digit ones. One threshold
+ * cannot match both, so it sits just ABOVE the later of the two — erring towards
+ * dropping the separator slightly early (two figures separated by a gap, still on
+ * one line) rather than late (a "·" dangling at the end of a wrapped line).
+ *
+ * MUST come after the rule it overrides: both selectors have the same specificity,
+ * so this wins on order alone. Placed above, it silently never applied.
+ *
+ * The query is on the CARD, not the viewport: this panel is mounted in the settings
+ * tab and in the sidebar, so a narrow card is not the same thing as a narrow screen.
+ * Where container queries are unavailable the rule simply does not apply and the
+ * separator stays — harmless.
+ */
+@container couchdb-sync-card (max-width: 15em) {
+	.couchdb-sync-summary-part:not(:last-child)::after {
+		content: "";
+	}
 }
 
 .couchdb-sync-summary-ok {

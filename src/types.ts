@@ -1,11 +1,22 @@
 export type ConflictStrategy = "master" | "newest";
 
 /**
+ * Where the key that protects the credentials in `data.json` comes from.
+ *
+ * - "device": a random key held in this device's (vault-scoped) local storage, which
+ *   is never part of the vault. No prompt, ever.
+ * - "ask": a passphrase the user types once per launch; it lives only in memory.
+ *
+ * See `secrets.ts` for the mechanism.
+ */
+export type SecretsMode = "device" | "ask";
+
+/**
  * Settings schema version. Bumped whenever the persisted shape changes in a way
  * that needs a one-time migration (see `migrateSettings` in main.ts). Fresh
  * installs are stamped with the current version and skip migration.
  */
-export const CURRENT_SETTINGS_VERSION = 5;
+export const CURRENT_SETTINGS_VERSION = 6;
 
 export interface CouchDBSyncSettings {
 	/** persisted settings schema version; drives one-time migrations */
@@ -16,12 +27,30 @@ export interface CouchDBSyncSettings {
 	/** remote database name */
 	dbName: string;
 	username: string;
+	/**
+	 * CouchDB password. RUNTIME ONLY — never written to data.json; it is sealed into
+	 * `encryptedSecrets` on save and restored into this field on load (see secrets.ts).
+	 */
 	password: string;
 
 	/** end-to-end encryption of document content (at rest on the server) */
 	e2eeEnabled: boolean;
-	/** shared secret; MUST match on every device. Never replicated. */
+	/**
+	 * Shared secret; MUST match on every device. Never replicated, and — like
+	 * `password` — RUNTIME ONLY: it is persisted inside `encryptedSecrets`, never in
+	 * the clear.
+	 */
 	passphrase: string;
+
+	/** where the key protecting `encryptedSecrets` comes from */
+	secretsMode: SecretsMode;
+
+	/**
+	 * The sealed `{ password, passphrase }` blob, the only form in which those two
+	 * ever touch the disk. Opaque without the key, which lives outside the vault.
+	 * Empty until credentials are first entered.
+	 */
+	encryptedSecrets: string;
 
 	/** how conflicts are resolved automatically, without prompting */
 	conflictStrategy: ConflictStrategy;
@@ -175,6 +204,8 @@ export const DEFAULT_SETTINGS: CouchDBSyncSettings = {
 	password: "",
 	e2eeEnabled: true, // encryption on by default
 	passphrase: "",
+	secretsMode: "device",
+	encryptedSecrets: "",
 	conflictStrategy: "newest",
 	isMaster: false,
 	deviceId: "",

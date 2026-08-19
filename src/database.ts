@@ -16,7 +16,7 @@ import {
 	hydrateVersion,
 	toStoredId,
 } from "./envelope";
-import { base64ToUint8, uint8ToBase64 } from "./util";
+import { base64ToUint8, toError, uint8ToBase64 } from "./util";
 
 const RANGE_END = "￿";
 
@@ -224,6 +224,29 @@ export class SyncDatabase {
 		return this.remote;
 	}
 
+	/**
+	 * Drop the cached remote handle so the next use builds a fresh one.
+	 *
+	 * The handle bakes `auth` in at construction (see connectRemote), so it keeps
+	 * presenting whatever credentials were current when it was made — for its whole
+	 * lifetime. Without this, editing the password, or unlocking credentials that were
+	 * locked when the handle was built, left every automatic path (the idle server
+	 * scan reuses `this.remote`) authenticating with the OLD or EMPTY password on a
+	 * timer. A server that throttles repeated failed logins then locks the account out,
+	 * and the plugin can never recover on its own because nothing rebuilds the handle.
+	 */
+	closeRemote(): void {
+		if (!this.remote) return;
+		void this.remote.close().catch(() => undefined);
+		this.remote = null;
+		this.hydratedRemoteCache.clear();
+	}
+
+	/** Are there credentials to authenticate with at all? */
+	hasCredentials(): boolean {
+		return !!this.settings.username && !!this.settings.password;
+	}
+
 	/** Verify credentials + reachability. Returns a human-readable result. */
 	async testConnection(): Promise<{ ok: boolean; message: string }> {
 		try {
@@ -262,6 +285,13 @@ export class SyncDatabase {
 		}
 		const seen = wires.length;
 		let failed = 0;
+		/**
+		 * First decrypt failure of this scan. Reported ONCE at the end instead of once
+		 * per document: a locked or passphrase-less vault fails on every doc, which
+		 * turned a single condition into hundreds of identical stack traces in the
+		 * console — noise that buries whatever actually went wrong.
+		 */
+		let firstFailure: Error | undefined;
 		// Rebuilt each scan so docs that disappeared drop out of the cache (bounded).
 		const nextCache = new Map<string, { rev: string; doc: FileDoc }>();
 		const out: (FileDoc | null)[] = new Array<FileDoc | null>(wires.length).fill(null);
@@ -299,12 +329,17 @@ export class SyncDatabase {
 						nextCache.set(d._id, { rev: d._rev ?? "", doc });
 					} catch (e) {
 						failed++;
-						console.error("[couchdb-sync] cannot decrypt file doc", d._id, e);
+						firstFailure ??= toError(e);
 					}
 				})
 			);
 		}
 
+		if (failed > 0) {
+			console.warn(
+				`[couchdb-sync] ${failed} of ${seen} file doc(s) could not be decrypted: ${firstFailure?.message ?? "unknown error"}`
+			);
+		}
 		this.hydratedCache = nextCache;
 		// Remember whether a scan hit encrypted docs it could not decrypt at all —
 		// the index report uses this to detect a wrong passphrase (see getDecryptStats).
@@ -331,6 +366,21 @@ export class SyncDatabase {
 	 * render an honest "server unreachable (401)" instead of a false "in sync".
 	 */
 	async scanRemote(): Promise<RemoteScan> {
+		// Never send a login we know is incomplete. This runs on a timer, so an empty
+		// password (credentials still locked, or not entered yet) would otherwise become
+		// a steady drip of failed authentications — the fastest way to get throttled or
+		// locked out by the server.
+		if (!this.hasCredentials()) {
+			return {
+				reachable: false,
+				error: "auth",
+				message: "no credentials available",
+				paths: [],
+				conflicts: [],
+				count: 0,
+				decryptFailed: 0,
+			};
+		}
 		const r = this.remote ?? this.connectRemote();
 		let res: PouchDB.Core.AllDocsResponse<FileDoc>;
 		try {
@@ -584,6 +634,131 @@ export class SyncDatabase {
 	/** Permanently delete the local replica (used by "Reset local database"). */
 	async destroyLocal(): Promise<void> {
 		await this.local.destroy();
+	}
+
+	/**
+	 * Empty the remote, by whichever means this account is allowed.
+	 *
+	 * Dropping the database is the clean way — it reclaims the space and leaves
+	 * nothing behind — but in CouchDB 3 that is a SERVER ADMIN operation, and a
+	 * sync account is normally just a member of one database. So a refusal is an
+	 * expected outcome, not an error: fall back to deleting every document, which
+	 * needs no more rights than ordinary syncing does.
+	 *
+	 * Returns which route was taken, because the outcomes differ in a way the user
+	 * has to know about (see deleteAllRemoteDocs).
+	 */
+	async resetRemote(
+		onProgress?: (deleted: number) => void
+	): Promise<{ strategy: "dropped" | "emptied"; deleted: number }> {
+		try {
+			await this.destroyRemote();
+			return { strategy: "dropped", deleted: 0 };
+		} catch (e) {
+			const err = e as { status?: number; message?: string };
+			// 401/403 = not allowed to drop databases. Anything else (network, 404,
+			// a failed recreate) is a real failure and must not be papered over by
+			// silently deleting documents instead.
+			if (err.status !== 401 && err.status !== 403) throw e;
+		}
+		const deleted = await this.deleteAllRemoteDocs(onProgress);
+		return { strategy: "emptied", deleted };
+	}
+
+	/**
+	 * Mark every document in the remote database deleted, in batches.
+	 *
+	 * Needs only write access — the same right syncing already uses. What it leaves
+	 * behind is a deletion stub ("tombstone") per document: CouchDB keeps those on
+	 * purpose, because they are how the deletion reaches every other replica. They
+	 * carry no content and are excluded from every count the plugin shows, but the
+	 * space the old documents occupied comes back only on compaction, which is again
+	 * an admin operation. Dropping the database is therefore still the better route
+	 * where it is permitted.
+	 *
+	 * Paging walks the key space forward with `startkey` and never revisits it. Design
+	 * documents are left alone: they are not ours to delete, and they sort in the
+	 * middle of our own id ranges.
+	 */
+	async deleteAllRemoteDocs(onProgress?: (deleted: number) => void): Promise<number> {
+		const r = this.remote ?? this.connectRemote();
+		const BATCH = 200;
+		let startkey = "";
+		let deleted = 0;
+		for (;;) {
+			const page = await r.allDocs({ limit: BATCH, startkey });
+			if (page.rows.length === 0) break;
+			const last = page.rows[page.rows.length - 1].id;
+
+			const batch = page.rows
+				.filter((row) => !row.id.startsWith("_design/") && row.value.rev)
+				.map((row) => ({ _id: row.id, _rev: row.value.rev, _deleted: true }));
+
+			if (batch.length > 0) {
+				const results = await r.bulkDocs(batch as unknown as FileDoc[]);
+				const failures = results.filter((x) => "error" in x && x.error);
+				deleted += results.length - failures.length;
+				onProgress?.(deleted);
+				if (failures.length === results.length) {
+					const first = failures[0] as { reason?: string; name?: string };
+					throw new Error(
+						`Could not delete documents on the server (${first.reason ?? first.name ?? "unknown reason"}).`
+					);
+				}
+			}
+
+			if (page.rows.length < BATCH) break; // that was the last page
+			// Advance strictly past the last id we handled. NOT `skip`: the documents in
+			// this page are gone from the index the moment they are deleted, so a skip
+			// counted against the shrinking result set would step over live documents
+			// and leave them behind. A key cursor cannot: it only ever moves forward,
+			// which also guarantees this loop ends.
+			// The separator is \u0000 rather than any printable character: history ids
+			// embed a NEWLINE (HISTORY_SEP), which sorts below a space, so a cursor of
+			// `last + " "` would jump over a path's own history documents. Nothing
+			// sorts below \u0000, so nothing can be skipped.
+			startkey = last + "\u0000";
+		}
+		return deleted;
+	}
+
+	/**
+	 * Delete the REMOTE database and recreate it empty.
+	 *
+	 * Everything the server holds goes: file documents, every content chunk, and the
+	 * whole version history — they all live in the one database. There is no partial
+	 * form of this; CouchDB has no "delete all documents" that actually reclaims the
+	 * space, and deleting documents one by one would leave a tombstone per document,
+	 * which is precisely the sort of residue this exists to clear.
+	 *
+	 * The database is recreated immediately (without `skip_setup`, so PouchDB issues
+	 * the PUT) — leaving it absent would make every later request a 404 that reads
+	 * like a configuration error.
+	 */
+	async destroyRemote(): Promise<void> {
+		const r = this.remote ?? this.connectRemote();
+		await r.destroy();
+		this.remote = null;
+		this.hydratedRemoteCache.clear();
+		const fresh = new PouchDB<FileDoc>(this.remoteUrl(), {
+			auth: { username: this.settings.username, password: this.settings.password },
+			fetch: obsidianFetch(),
+		});
+		try {
+			await fresh.info(); // forces the create and proves it worked
+		} catch (e) {
+			// Deleting a database and creating one are separate CouchDB permissions, so
+			// an account may be allowed the first and not the second. Say exactly that:
+			// the old data is already gone, and the only way forward is to create the
+			// database by hand — a bare "info failed" would send the user hunting for a
+			// connection problem that does not exist.
+			const err = e as { message?: string };
+			throw new Error(
+				`The database was deleted but could not be recreated (${err.message ?? "unknown error"}). ` +
+					`Create "${this.settings.dbName}" on the server manually, then run the sync again.`
+			);
+		}
+		this.remote = fresh;
 	}
 
 	// --- per-device local state (not replicated) ---------------------------

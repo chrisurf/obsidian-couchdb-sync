@@ -56,6 +56,12 @@ Your notes sync through a **CouchDB** server that you choose — rented, or runn
 
 Then set a **passphrase** and keep it identical on every device. It locks your notes before they leave this device, so the server only ever stores unreadable data — and nobody, including you, can recover your notes without it. Write it down somewhere safe.
 
+## 🔐 Your password no longer sits in a file
+
+Your server password and your encryption passphrase used to be stored as plain text in the plugin's \`data.json\` — inside your vault, and so inside every copy, backup and file-sync of it. They are now kept **encrypted**, unlocked by a key that lives on this device only and never travels with the vault. Nothing to set up: it happens on the next save.
+
+If you copy a vault to another device, it therefore arrives *without* usable credentials — enter them once there, as you would for a new device. Prefer a passphrase over a device key? **Settings → Credential storage** can ask for one at every launch instead.
+
 ## 🎛️ Sync from the status bar
 
 The status-bar item at the bottom of Obsidian is now two controls:

@@ -19,6 +19,8 @@ src/
   engine.ts      Core sync engine (indexing, upload, download, conflict resolution)
   database.ts    PouchDB/CouchDB abstraction, CORS-free fetch via Obsidian requestUrl
   crypto.ts      AES-256-GCM end-to-end encryption (PBKDF2 key derivation)
+  secrets.ts     Credential sealing: keeps password/passphrase out of data.json
+  secretsmodal.ts  Passphrase prompt for the "ask at every launch" credential mode
   envelope.ts    Engine <-> wire form: metadata-private document envelope
   history.ts     File version history UI (diff viewer, restore modal)
   diffmerge.ts   Side-by-side diff & merge editor for divergent files
@@ -34,6 +36,7 @@ src/
 - **CORS bypass**: `database.ts` wraps Obsidian's `requestUrl()` as a fetch implementation for PouchDB, avoiding CORS issues on desktop and mobile.
 - **Vault isolation**: Each vault gets a unique `localDbId` so PouchDB databases never collide, even for vaults with the same name.
 - **Five-state file classification**: synced, local-only, remote-only, drift (content differs, no conflict), conflict (concurrent edits). Severity-based folder rollup in the UI.
+- **No credentials in `data.json`**: the CouchDB password and the E2EE passphrase are runtime-only fields on the settings object. `saveSettings` seals them into `encryptedSecrets` and deletes the plain keys from the persisted copy; `loadSettings` restores them. The key lives outside the vault (device-local storage, or a passphrase asked per launch), so a copied/backed-up vault carries no usable credentials. Invariant: **while the blob cannot be read, saving must pass the stored blob through untouched** — the crash guard and teardown both save before/without an unlock, and re-sealing empty credentials there would destroy them.
 
 ### Module Boundaries
 
