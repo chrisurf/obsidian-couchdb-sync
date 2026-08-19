@@ -337,6 +337,11 @@ export class IndexPanel {
 		if (!on) return st.detail ?? "Sync is switched off for this vault.";
 
 		const s = this.plugin.settings;
+		// Locked credentials look exactly like "nothing configured" from here, so say
+		// what actually happened — the vault was copied here, or its device key is gone.
+		if (!this.plugin.secretsAreUnlocked()) {
+			return "Your stored credentials are locked on this device — unlock or re-enter them in settings.";
+		}
 		if (!s.serverUrl || !s.username) {
 			return "Not configured yet — fill in the CouchDB connection below.";
 		}

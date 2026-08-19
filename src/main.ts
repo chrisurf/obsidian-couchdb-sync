@@ -4,12 +4,23 @@ import {
 	CouchDBSyncSettings,
 	CURRENT_SETTINGS_VERSION,
 	DEFAULT_SETTINGS,
+	SecretsMode,
 	SYNC_STATE,
 	SyncState,
 	SyncStatus,
 	VersionDoc,
 } from "./types";
 import { migrateSettings } from "./migrate";
+import {
+	clearSecretKeyCache,
+	decideSealAction,
+	DeviceKeyStore,
+	loadOrCreateDeviceKey,
+	sealSecrets,
+	toPersisted,
+	unsealSecrets,
+} from "./secrets";
+import { askNewSecretsPassphrase, askUnlockPassphrase } from "./secretsmodal";
 import { RemoteScan, SyncDatabase } from "./database";
 import { SyncEngine, IndexReport, buildIndexReport, removeFromDb } from "./engine";
 import { CouchDBSyncSettingTab } from "./settings";
@@ -105,6 +116,35 @@ export default class CouchDBSyncPlugin extends Plugin {
 	private statusIconEl!: HTMLElement;
 	private statusTextEl!: HTMLElement;
 	private restartLock: Promise<void> = Promise.resolve();
+
+	// --- credential storage (see secrets.ts) ---------------------------------
+	/** Key material that opens `encryptedSecrets`; null while locked. */
+	private secretKey: string | null = null;
+	/** The sealed blob exactly as it sits on disk. */
+	private sealedSecrets = "";
+	/**
+	 * True once the blob has been opened — or there was nothing to open (fresh vault,
+	 * or a pre-v6 config whose plaintext is still in memory waiting to be sealed).
+	 * While false, the credentials in `settings` are NOT the ones on disk, so saving
+	 * must leave the stored blob alone.
+	 */
+	private secretsUnlocked = false;
+	/** De-dupes the unlock prompt when several callers hit a locked vault at once. */
+	private unlockInFlight: Promise<boolean> | null = null;
+	/** The user dismissed the unlock prompt; automatic paths stop re-asking. */
+	private unlockPromptDeclined = false;
+	/**
+	 * Device-local key store. Obsidian scopes this storage per vault and keeps it
+	 * outside the vault folder, which is the whole point: copying, backing up or
+	 * syncing the vault does not carry the key with it.
+	 */
+	private deviceStore: DeviceKeyStore = {
+		get: (key) => {
+			const raw: unknown = this.app.loadLocalStorage(key);
+			return typeof raw === "string" && raw.length > 0 ? raw : null;
+		},
+		set: (key, value) => this.app.saveLocalStorage(key, value),
+	};
 
 	/** Latest status, shared with the settings view via listeners. */
 	status: SyncStatus = { state: SYNC_STATE.IDLE };
@@ -342,6 +382,10 @@ export default class CouchDBSyncPlugin extends Plugin {
 		this.settings.unsafeShutdown = false;
 		this.settings.unsafeShutdownStreak = 0;
 		await this.saveSettings().catch(() => undefined);
+		// Drop the derived credential key. In "ask" mode the passphrase must never
+		// outlive the session that asked for it.
+		clearSecretKeyCache();
+		this.secretKey = null;
 	}
 
 	private setStatus(state: SyncState, detail?: string): void {
@@ -554,6 +598,18 @@ export default class CouchDBSyncPlugin extends Plugin {
 		this.engine = null;
 		// Keep the shared local DB handle OPEN across restarts (see getSharedDb): the
 		// engine and idle readers share ONE handle, so it must never be closed here.
+
+		// Credentials must be readable before anything touches the network. This is the
+		// one place that prompts in "ask" mode (every start path funnels through here),
+		// and the one place that stops a locked device from replicating with empty
+		// credentials — which would look like a wrong passphrase to the user.
+		if (!this.secretsUnlocked && !(await this.ensureSecretsUnlocked())) {
+			this.setStatus(
+				SYNC_STATE.ERROR,
+				"Your stored credentials are locked on this device. Unlock them (or re-enter them) in settings."
+			);
+			return;
+		}
 
 		if (!this.settings.serverUrl || !this.settings.username) {
 			this.setStatus(SYNC_STATE.IDLE);
@@ -1096,7 +1152,195 @@ export default class CouchDBSyncPlugin extends Plugin {
 			this.settings.localDbId = generateDeviceId();
 			dirty = true;
 		}
+
+		// Credentials: everything above merged the PERSISTED shape, in which the two
+		// secrets are absent (v6+) or plaintext leftovers (pre-v6). Open the sealed blob
+		// so the rest of the plugin sees the same live `settings.password` /
+		// `settings.passphrase` it always has.
+		this.sealedSecrets =
+			typeof this.settings.encryptedSecrets === "string" ? this.settings.encryptedSecrets : "";
+		await this.openSecrets();
+		// A pre-v6 config arrives with plaintext credentials in `loaded`; the save below
+		// (dirty is set by the schema bump) is what seals them and drops the plain keys.
 		if (dirty) await this.saveSettings();
+	}
+
+	/**
+	 * Unlock the stored credentials at load time.
+	 *
+	 * "device" mode succeeds silently — the key is generated on first use, so a fresh
+	 * install never prompts. It fails only when the vault (and with it `data.json`) was
+	 * copied from another device or its local storage was cleared; then the blob stays
+	 * unreadable and we deliberately stay locked rather than guess.
+	 *
+	 * "ask" mode cannot be resolved here at all: `onload` runs before the workspace is
+	 * ready and a modal at that point fights with Obsidian for the screen. It stays
+	 * locked until `ensureSecretsUnlocked()` prompts once the layout is up.
+	 */
+	private async openSecrets(): Promise<void> {
+		this.secretKey = null;
+		this.secretsUnlocked = false;
+
+		if (this.settings.secretsMode === "ask") {
+			// Stays locked either way: with a blob, `ensureSecretsUnlocked` asks for the
+			// passphrase that opens it; without one (only reachable via a hand-edited
+			// data.json, since switching to this mode always writes a blob) it asks for a
+			// fresh passphrase instead. Reporting "unlocked" here would be worse than
+			// useless — there would be no key to seal anything typed afterwards with, and
+			// the credentials would vanish on the next launch.
+			return;
+		}
+
+		const key = loadOrCreateDeviceKey(this.deviceStore);
+		if (!key) {
+			// No device storage means no key we could ever read back — staying locked
+			// keeps the credentials off the disk instead of writing them unprotected.
+			console.warn("[couchdb-sync] no device key store available; credentials stay locked");
+			return;
+		}
+		this.secretKey = key;
+		if (!this.sealedSecrets) {
+			// Fresh vault, or a pre-v6 config whose plaintext credentials are already in
+			// `settings` — either way there is nothing to open and saving may seal.
+			this.secretsUnlocked = true;
+			return;
+		}
+		const opened = await unsealSecrets(this.sealedSecrets, key);
+		if (!opened) return; // wrong/absent key: locked, blob preserved
+		this.settings.password = opened.password;
+		this.settings.passphrase = opened.passphrase;
+		this.secretsUnlocked = true;
+	}
+
+	/** Are the stored credentials readable on this device right now? */
+	secretsAreUnlocked(): boolean {
+		return this.secretsUnlocked;
+	}
+
+	/** Are there actual credentials behind the seal (as opposed to an empty one)? */
+	hasStoredSecrets(): boolean {
+		if (!this.sealedSecrets) return false;
+		if (!this.secretsUnlocked) return true; // sealed but unreadable — something is in there
+		return !!(this.settings.password || this.settings.passphrase);
+	}
+
+	/**
+	 * Make sure the credentials are readable, prompting once in "ask" mode. Concurrent
+	 * callers share the single in-flight prompt so a mobile resume plus a Force sync
+	 * cannot stack two modals. Returns false when the vault stays locked.
+	 *
+	 * A cancelled prompt is remembered: automatic paths (launch, mobile resume
+	 * recovery, a queued restart) then stop asking, so dismissing the dialog once does
+	 * not turn every background restart into another modal. `force` — the explicit
+	 * Unlock button — clears that and asks again.
+	 */
+	async ensureSecretsUnlocked(force = false): Promise<boolean> {
+		if (this.secretsUnlocked) return true;
+		if (this.settings.secretsMode !== "ask") return false; // no prompt can fix a bad device key
+		if (force) this.unlockPromptDeclined = false;
+		else if (this.unlockPromptDeclined) return false;
+		if (this.unlockInFlight) return this.unlockInFlight;
+
+		const attempt = async (): Promise<boolean> => {
+			// Nothing sealed to open: ask for a passphrase to protect the credentials
+			// from here on, so the mode repairs itself instead of dead-ending.
+			if (!this.sealedSecrets) {
+				const chosen = await askNewSecretsPassphrase(this.app);
+				if (!chosen) {
+					this.unlockPromptDeclined = true;
+					return false;
+				}
+				this.secretKey = chosen;
+				this.secretsUnlocked = true;
+				await this.saveSettings();
+				return true;
+			}
+			const entered = await askUnlockPassphrase(this.app);
+			if (!entered) {
+				this.unlockPromptDeclined = true;
+				return false;
+			}
+			const opened = await unsealSecrets(this.sealedSecrets, entered);
+			if (!opened) {
+				new Notice("CouchDB Sync: that passphrase does not unlock the stored credentials.");
+				return false;
+			}
+			this.secretKey = entered;
+			this.settings.password = opened.password;
+			this.settings.passphrase = opened.passphrase;
+			this.secretsUnlocked = true;
+			return true;
+		};
+
+		this.unlockInFlight = attempt();
+		try {
+			return await this.unlockInFlight;
+		} finally {
+			this.unlockInFlight = null;
+		}
+	}
+
+	/**
+	 * Give up on an unreadable blob and start over on this device: discard it, take a
+	 * fresh key, and leave the credential fields empty and editable again.
+	 *
+	 * This is the way out of the one state the user cannot otherwise leave — locked in
+	 * "ask" mode with the passphrase forgotten, where there is no key to seal newly
+	 * typed credentials with, so anything entered would be silently dropped on the next
+	 * launch. Nothing on the server is touched; only this device's stored copy of the
+	 * credentials goes away, and the user re-enters them.
+	 */
+	async resetStoredSecrets(): Promise<boolean> {
+		if (this.settings.secretsMode === "ask") {
+			const chosen = await askNewSecretsPassphrase(this.app);
+			if (!chosen) return false;
+			this.secretKey = chosen;
+		} else {
+			const key = loadOrCreateDeviceKey(this.deviceStore);
+			if (!key) {
+				new Notice("CouchDB Sync: this device cannot store a key for your credentials.");
+				return false;
+			}
+			this.secretKey = key;
+		}
+		this.settings.password = "";
+		this.settings.passphrase = "";
+		this.sealedSecrets = "";
+		this.secretsUnlocked = true;
+		this.unlockPromptDeclined = false;
+		await this.saveSettings();
+		return true;
+	}
+
+	/**
+	 * Switch where the credential key comes from. Requires the credentials to be
+	 * readable first — re-sealing a blob we cannot open would throw away the password
+	 * and the passphrase behind it. Returns false when the change did not happen.
+	 */
+	async setSecretsMode(mode: SecretsMode): Promise<boolean> {
+		if (mode === this.settings.secretsMode) return true;
+		if (!(await this.ensureSecretsUnlocked(true))) {
+			new Notice("CouchDB Sync: unlock your stored credentials before changing how they are kept.");
+			return false;
+		}
+		if (mode === "ask") {
+			const chosen = await askNewSecretsPassphrase(this.app);
+			if (!chosen) return false;
+			this.secretKey = chosen;
+		} else {
+			const key = loadOrCreateDeviceKey(this.deviceStore);
+			if (!key) {
+				new Notice("CouchDB Sync: this device cannot store a key; keeping the current setting.");
+				return false;
+			}
+			this.secretKey = key;
+		}
+		this.settings.secretsMode = mode;
+		this.secretsUnlocked = true;
+		// Re-seal immediately under the new key, so the blob on disk and the mode that
+		// describes how to open it are never out of step.
+		await this.saveSettings();
+		return true;
 	}
 
 	/**
@@ -1137,7 +1381,44 @@ export default class CouchDBSyncPlugin extends Plugin {
 		}
 	}
 
+	/**
+	 * Persist the settings with the credentials sealed (see secrets.ts). The live
+	 * `settings.password` / `settings.passphrase` are left untouched — the rest of the
+	 * plugin keeps reading them exactly as before; only the copy that goes to
+	 * `data.json` has them replaced by the encrypted blob.
+	 */
 	async saveSettings(): Promise<void> {
-		await this.saveData(this.settings);
+		const blob = await this.sealForDisk();
+		this.settings.encryptedSecrets = blob; // keep the in-memory view honest
+		await this.saveData(toPersisted(this.settings, blob));
+	}
+
+	/**
+	 * The blob to write — a fresh seal, or the stored one passed through untouched.
+	 * `decideSealAction` owns that call (and documents why it matters).
+	 */
+	private async sealForDisk(): Promise<string> {
+		const key = this.secretKey;
+		const action = decideSealAction({
+			key,
+			unlocked: this.secretsUnlocked,
+			password: this.settings.password,
+			passphrase: this.settings.passphrase,
+		});
+		if (action === "keep" || !key) return this.sealedSecrets;
+		try {
+			const blob = await sealSecrets(
+				{ password: this.settings.password, passphrase: this.settings.passphrase },
+				key
+			);
+			this.sealedSecrets = blob;
+			// Re-entering credentials over an unreadable blob is a legitimate recovery,
+			// and it leaves the vault unlocked again.
+			this.secretsUnlocked = true;
+			return blob;
+		} catch (e) {
+			console.error("[couchdb-sync] could not seal credentials", e);
+			return this.sealedSecrets;
+		}
 	}
 }

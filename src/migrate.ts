@@ -28,6 +28,15 @@ import { CouchDBSyncSettings, defaultHiddenExclude } from "./types";
  * (teardown runs on ordinary app close too, so an always-on wipe would destroy the
  * cache on every quit; the explicit "Wipe local cache" action covers the privacy
  * case). Strip the now-dead `forgetCacheOnDisable` key.
+ *
+ * v6: the CouchDB password and the E2EE passphrase are no longer stored in the
+ * clear. A pre-v6 data.json holds both as plain strings; they are read into the
+ * runtime settings by the normal default-merge, and the very next save seals them
+ * into `encryptedSecrets` and drops the plaintext keys (see `secrets.ts` and
+ * `CouchDBSyncPlugin.saveSettings`). Nothing to rewrite here — this step exists so
+ * the version bump is recorded and the save that performs the sealing is triggered.
+ * Note for users: this cleans the CURRENT data.json only; older backups of it still
+ * contain the plaintext credentials.
  */
 export function migrateSettings(
 	settings: CouchDBSyncSettings & Record<string, unknown>,

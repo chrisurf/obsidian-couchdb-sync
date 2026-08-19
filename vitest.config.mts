@@ -15,7 +15,14 @@ export default defineConfig({
 		coverage: {
 			provider: "v8",
 			include: ["src/**/*.ts"],
-			exclude: ["src/main.ts", "src/settings.ts", "src/indexpanel.ts", "src/view.ts"],
+			exclude: [
+				"src/main.ts",
+				"src/settings.ts",
+				"src/indexpanel.ts",
+				"src/view.ts",
+				// Obsidian-API-only UI (Modal); covered by the e2e suite.
+				"src/secretsmodal.ts",
+			],
 		},
 	},
 });
