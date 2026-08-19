@@ -812,8 +812,12 @@ export class SyncEngine {
 		if (this.aborted) return;
 		void (async () => {
 			await this.cleanupTempFiles();
-			await this.uploadOnce();
-			if (!this.aborted) {
+			const uploaded = await this.uploadOnce();
+			// Only claim success for a pass that actually finished. Settling to SYNCED
+			// regardless is how a run that uploaded nothing still reported "In sync"
+			// beside its own "112 pending" — fail() has already set the honest state
+			// (an error, or "reconnecting" for a closed local connection), so leave it.
+			if (!this.aborted && uploaded) {
 				this.onReady();
 				// The forced one-shot pass is done. Hand back to continuous live sync so
 				// later edits keep propagating instead of the engine sitting inert while the
@@ -825,7 +829,8 @@ export class SyncEngine {
 		})();
 	}
 
-	private async uploadOnce(): Promise<void> {
+	/** Returns whether the pass completed; false means fail() has set the state. */
+	private async uploadOnce(): Promise<boolean> {
 		const remote = this.db.remote ?? this.db.connectRemote();
 		this.markActivity();
 		const opts = { batch_size: 25, batches_limit: 2 };
@@ -852,8 +857,10 @@ export class SyncEngine {
 			this.oneShot = null;
 			await this.resolveConflicts();
 			await this.persistSyncState();
+			return true;
 		} catch (e) {
 			this.fail("upload", e);
+			return false;
 		}
 	}
 

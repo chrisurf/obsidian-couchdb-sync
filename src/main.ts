@@ -841,9 +841,23 @@ export default class CouchDBSyncPlugin extends Plugin {
 
 		// The replica mirrors what we just deleted, so it has to go too — otherwise the
 		// upload below would re-push every document the reset was meant to remove.
-		await db.destroyLocal().catch(() => undefined);
+		//
+		// It is replaced by a replica under a NEW name rather than destroyed in place.
+		// IndexedDB finishes a deleteDatabase only once every connection to it has
+		// closed, so a handle opened moments later on the same name can be wiped out
+		// from underneath the upload that follows. That is not theoretical: it emptied
+		// the server, uploaded nothing, and reported success — every write hit a closing
+		// connection, which fail() classifies as the recoverable "IDB closing" case and
+		// logs at debug level, so it did not even leave a visible trace. A fresh name has
+		// no connections to wait for and cannot be raced.
+		const stale = this.db;
+		this.settings.localDbId = generateDeviceId();
+		await this.saveSettings();
 		this.db = null;
 		this.reportInFlight = null;
+		// The old replica is now unreachable; clearing it is housekeeping, and a failure
+		// costs disk space rather than correctness.
+		void stale?.destroyLocal().catch(() => undefined);
 
 		// Fresh replica, then index this device's files into it and push. Sync must be
 		// ON for the upload to run at all (doRestart's master switch), so a reset from
