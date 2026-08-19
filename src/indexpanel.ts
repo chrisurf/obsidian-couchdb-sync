@@ -616,18 +616,28 @@ export class IndexPanel {
 		const allDone = localDone === syncTotal && (serverDone === null || serverDone === syncTotal);
 
 		summary.className = "couchdb-sync-summary";
+		summary.empty();
+		/**
+		 * Each half goes in its own nowrap span so a narrow panel breaks BETWEEN them
+		 * rather than through "112 / 112 local". The panel is mounted both in settings
+		 * and in the sidebar, and on a phone it is narrow in either — one long line
+		 * would wrap at whatever character happened to reach the edge.
+		 */
+		const part = (text: string) => summary.createSpan({ cls: "couchdb-sync-summary-part", text });
 		if (allDone) {
 			summary.addClass("couchdb-sync-summary-ok");
-			summary.setText(`${syncTotal} / ${syncTotal} files in sync`);
+			part(`${syncTotal} / ${syncTotal} files in sync`);
 		} else if (serverDone !== null) {
 			// Both halves, each named, so it is always clear WHERE the remaining work is.
 			summary.addClass("couchdb-sync-summary-pending");
-			summary.setText(`${localDone} / ${syncTotal} local · ${serverDone} / ${syncTotal} on server`);
+			part(`${localDone} / ${syncTotal} local`);
+			part(`${serverDone} / ${syncTotal} on server`);
 		} else {
 			// No server reading available — report the half we can actually vouch for.
 			const pct = syncTotal === 0 ? 100 : Math.round((localDone / syncTotal) * 100);
 			summary.addClass("couchdb-sync-summary-pending");
-			summary.setText(`${localDone} / ${syncTotal} local (${pct}%) · ${syncTotal - localDone} pending`);
+			part(`${localDone} / ${syncTotal} local (${pct}%)`);
+			part(`${syncTotal - localDone} pending`);
 		}
 		// className was just reset above, so re-apply the activity marker.
 		this.markSummaryActivity();
