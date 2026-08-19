@@ -589,6 +589,40 @@ export class CouchDBSyncSettingTab extends PluginSettingTab {
 							)
 					),
 					row(
+						"Reset the server from this device",
+						"Delete EVERYTHING on the server and replace it with this device's files. Removes " +
+							"leftovers no other action can reach — duplicate documents from an older version, " +
+							"orphaned data, the entire version history. Use this when the server state is wrong " +
+							"and this vault is the copy you trust.",
+						(setting) =>
+							setting.addButton((b) =>
+								b
+									.setDestructive()
+									.setButtonText("Reset server")
+									.onClick(() => {
+										confirm(this.app, {
+											title: "Delete everything on the server?",
+											body:
+												"The database on the server is deleted and rebuilt from this device: " +
+												`${this.plugin.settings.dbName} on ${this.plugin.settings.serverUrl}.\n\n` +
+												"Gone for good: every file version in the history, and anything that " +
+												"exists ONLY on the server (files no longer on this device are not " +
+												"restored). Your notes on this device are not touched.\n\n" +
+												"Every other device still holds a copy of the old database and will " +
+												"push it back when it syncs. On each of them: switch sync off now, " +
+												"and run “Wipe local cache” before switching it on again.",
+											cta: "Delete and re-upload",
+											danger: true,
+											onConfirm: async () => {
+												new Notice("Emptying the server and re-uploading…");
+												await this.plugin.resetServerFromLocal();
+												this.update();
+											},
+										});
+									})
+							)
+					),
+					row(
 						"Wipe local cache",
 						"Delete this device's local copy only — fast, and the server is NOT touched. Afterwards press “Force sync” or “Download only” to rebuild it.",
 						(setting) =>

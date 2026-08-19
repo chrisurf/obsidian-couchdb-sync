@@ -775,6 +775,85 @@ export default class CouchDBSyncPlugin extends Plugin {
 	}
 
 	/**
+	 * Make the server an exact copy of THIS device: delete the remote database, wipe
+	 * the local replica, and upload every file on disk into the fresh database.
+	 *
+	 * Three steps in one action because doing any two of them is worse than doing all
+	 * three. Emptying the server alone accomplishes nothing: the local replica still
+	 * holds every document that was just deleted and pushes them straight back. And
+	 * wiping the replica without emptying the server would simply download the old
+	 * state again. Only the whole sequence produces "what is on this disk is what is
+	 * on the server, and nothing else".
+	 *
+	 * This is how a vault recovers from residue no per-file action can reach —
+	 * documents left behind by an older id scheme, orphaned chunks, a history that
+	 * has grown past its worth.
+	 *
+	 * NOT a substitute for coordination: every OTHER device still holds a replica of
+	 * the deleted database and will push it back the moment it syncs. Those devices
+	 * must wipe their local cache before they reconnect. The confirmation dialog says
+	 * so; there is nothing this device can do to enforce it.
+	 */
+	resetServerFromLocal(): Promise<void> {
+		this.engine?.abort();
+		this.restartLock = this.restartLock
+			.catch(() => undefined)
+			.then(() => this.doServerReset());
+		return this.restartLock;
+	}
+
+	private async doServerReset(): Promise<void> {
+		if (!this.secretsUnlocked && !(await this.ensureSecretsUnlocked())) {
+			this.setStatus(SYNC_STATE.ERROR, "Credentials are locked — unlock them first.");
+			return;
+		}
+		if (!this.settings.serverUrl || !this.settings.username) {
+			new Notice("CouchDB Sync: configure the server connection first.");
+			return;
+		}
+		if (this.settings.e2eeEnabled && !this.settings.passphrase) {
+			new Notice("CouchDB Sync: set the encryption passphrase first — the upload needs it.");
+			return;
+		}
+
+		this.engine?.stop();
+		this.engine = null;
+		if (this.reportInFlight) await this.reportInFlight.catch(() => undefined);
+		this.remoteScan = null;
+
+		this.setStatus(SYNC_STATE.CONNECTING, "Emptying the server…");
+		const db = this.getSharedDb();
+		try {
+			await db.destroyRemote();
+		} catch (e) {
+			const err = toError(e);
+			this.setStatus(SYNC_STATE.ERROR, `Could not reset the server: ${err.message}`);
+			new Notice(`CouchDB Sync: ${err.message}`, 15000);
+			// The local replica is deliberately NOT wiped here. Whether the delete failed
+			// outright or the recreate did, this replica is the only remaining copy of
+			// what the server held — throwing it away on the error path would turn a
+			// recoverable failure into real data loss.
+			return;
+		}
+
+		// The replica mirrors what we just deleted, so it has to go too — otherwise the
+		// upload below would re-push every document the reset was meant to remove.
+		await db.destroyLocal().catch(() => undefined);
+		this.db = null;
+		this.reportInFlight = null;
+
+		// Fresh replica, then index this device's files into it and push. Sync must be
+		// ON for the upload to run at all (doRestart's master switch), so a reset from
+		// a switched-off vault turns it on — the user just asked for an upload.
+		if (!this.settings.syncEnabled) {
+			this.settings.syncEnabled = true;
+			await this.saveSettings();
+		}
+		await this.doRestart("upload");
+		new Notice("CouchDB Sync: the server now holds exactly this device's files.");
+	}
+
+	/**
 	 * Stop the CURRENT session and go idle, without touching the master switch.
 	 *
 	 * No longer exposed as a control of its own: a second element that also means

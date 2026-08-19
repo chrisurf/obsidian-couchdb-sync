@@ -636,6 +636,45 @@ export class SyncDatabase {
 		await this.local.destroy();
 	}
 
+	/**
+	 * Delete the REMOTE database and recreate it empty.
+	 *
+	 * Everything the server holds goes: file documents, every content chunk, and the
+	 * whole version history — they all live in the one database. There is no partial
+	 * form of this; CouchDB has no "delete all documents" that actually reclaims the
+	 * space, and deleting documents one by one would leave a tombstone per document,
+	 * which is precisely the sort of residue this exists to clear.
+	 *
+	 * The database is recreated immediately (without `skip_setup`, so PouchDB issues
+	 * the PUT) — leaving it absent would make every later request a 404 that reads
+	 * like a configuration error.
+	 */
+	async destroyRemote(): Promise<void> {
+		const r = this.remote ?? this.connectRemote();
+		await r.destroy();
+		this.remote = null;
+		this.hydratedRemoteCache.clear();
+		const fresh = new PouchDB<FileDoc>(this.remoteUrl(), {
+			auth: { username: this.settings.username, password: this.settings.password },
+			fetch: obsidianFetch(),
+		});
+		try {
+			await fresh.info(); // forces the create and proves it worked
+		} catch (e) {
+			// Deleting a database and creating one are separate CouchDB permissions, so
+			// an account may be allowed the first and not the second. Say exactly that:
+			// the old data is already gone, and the only way forward is to create the
+			// database by hand — a bare "info failed" would send the user hunting for a
+			// connection problem that does not exist.
+			const err = e as { message?: string };
+			throw new Error(
+				`The database was deleted but could not be recreated (${err.message ?? "unknown error"}). ` +
+					`Create "${this.settings.dbName}" on the server manually, then run the sync again.`
+			);
+		}
+		this.remote = fresh;
+	}
+
 	// --- per-device local state (not replicated) ---------------------------
 
 	async getLocalDoc<T>(id: string): Promise<T | null> {
