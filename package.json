@@ -1,6 +1,6 @@
 {
 	"name": "obsidian-couchdb-sync",
-	"version": "0.39.1",
+	"version": "0.40.0",
 	"description": "Simple, reliable, end-to-end encrypted live sync for Obsidian against a self-hosted CouchDB.",
 	"main": "main.js",
 	"type": "module",
