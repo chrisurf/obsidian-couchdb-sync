@@ -300,8 +300,9 @@ On the device whose files you trust:
 4. Wait until the counters read the same number three times over — e.g.
    `112 / 112 local · 112 / 112 on server`.
 
-Then on **every other device**: switch sync off, enter the same new passphrase, press
-**Wipe local cache**, and switch sync back on. It downloads the vault afresh.
+**The new passphrase has to be entered on every other device by hand.** On each one:
+switch sync off, type in the same passphrase, press **Wipe local cache**, and switch
+sync back on. It downloads the vault afresh.
 
 > ⚠️ **The version history does not survive this.** The reset deletes everything on the
 > server, past versions included, and files that existed *only* on the server are gone

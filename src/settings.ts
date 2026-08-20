@@ -597,8 +597,9 @@ export class CouchDBSyncSettingTab extends PluginSettingTab {
 							"rights than syncing. Use this when the server state is wrong and this vault is the " +
 							"copy you trust. " +
 							"It is also how you change your encryption passphrase: switch sync off, enter the new " +
-							"passphrase above, then reset — every file is re-uploaded under the new key. Afterwards " +
-							"set the same passphrase on your other devices and wipe their local cache there.",
+							"passphrase above, then reset — every file is re-uploaded under the new key. The new " +
+							"passphrase then has to be entered on every other device by hand, followed by " +
+							"“Wipe local cache” there.",
 						(setting) =>
 							setting.addButton((b) =>
 								b
