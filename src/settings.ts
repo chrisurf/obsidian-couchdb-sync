@@ -1,9 +1,11 @@
 import { App, Notice, PluginSettingTab, Setting, type SettingDefinitionItem, type SettingDefinitionRender } from "obsidian";
 import type CouchDBSyncPlugin from "./main";
+import type { ResetPreflight } from "./main";
 import { SyncDatabase } from "./database";
 import { selfTest } from "./crypto";
 import { IndexPanel } from "./indexpanel";
 import { confirm } from "./history";
+import type { PathDelta } from "./util";
 
 /**
  * The plugin's settings tab: the sync status panel at the top, then the settings
@@ -67,6 +69,59 @@ export class CouchDBSyncSettingTab extends PluginSettingTab {
 					b.setIcon(shown ? "eye-off" : "eye").setTooltip(shown ? "Hide" : "Show");
 				})
 		);
+	}
+
+	/**
+	 * The destructive confirmation itself — unchanged from before the pre-flight, and
+	 * still the last thing between the user and an empty server.
+	 */
+	private confirmServerReset(): void {
+		confirm(this.app, {
+			title: "Delete everything on the server?",
+			body:
+				"The database on the server is deleted and rebuilt from this device: " +
+				`${this.plugin.settings.dbName} on ${this.plugin.settings.serverUrl}.\n\n` +
+				"Gone for good: every file version in the history, and anything that " +
+				"exists ONLY on the server (files no longer on this device are not " +
+				"restored). Your notes on this device are not touched.\n\n" +
+				"Every other device still holds a copy of the old database and will " +
+				"push it back when it syncs. On each of them: switch sync off now, " +
+				"and run “Wipe local cache” before switching it on again.",
+			cta: "Delete and re-upload",
+			danger: true,
+			onConfirm: async () => {
+				new Notice("Emptying the server and re-uploading…");
+				await this.plugin.resetServerFromLocal();
+				this.update();
+			},
+		});
+	}
+
+	/**
+	 * The extra dialog, shown ahead of the destructive one whenever the two sides
+	 * differ — or whenever the difference could not be measured at all.
+	 *
+	 * This is the only action that destroys data no other action can reach, and it was
+	 * the one where the user was given the least information: the case that costs data
+	 * (another device pushed files this one never had) looked exactly like the harmless
+	 * one. Confirming here only gets you to the confirmation.
+	 */
+	private confirmResetDelta(pre: ResetPreflight): void {
+		confirm(this.app, {
+			title: pre.checked
+				? "The server holds files this device does not"
+				: "Could not check what the reset would delete",
+			body: pre.checked
+				? "Everything below is deleted from the server. Only the files on this device are uploaded again."
+				: `The plugin could not read the server, so it cannot say what would be lost — ${pre.reason}. ` +
+					"That is not the same as “nothing”: another device may have pushed files this one has " +
+					"never seen. Cancel and try again once that is resolved, or continue deliberately.",
+			detail: pre.checked ? (el) => renderResetDelta(el, pre) : undefined,
+			cta: "Delete anyway",
+			danger: true,
+			focusCancel: true,
+			onConfirm: () => this.confirmServerReset(),
+		});
 	}
 
 	getSettingDefinitions(): SettingDefinitionItem[] {
@@ -496,44 +551,47 @@ export class CouchDBSyncSettingTab extends PluginSettingTab {
 					row(
 						"Sync hidden files",
 						`Hidden files are things like ${cfg} (your settings & plugins) and .git. ` +
-							"Normal notes & attachments are always synced. (Our own plugin's data.json is never synced.)",
+							"Off means none of them sync; the two lists below apply either way. " +
+							"(Our own plugin's data.json is never synced.)",
 						(setting) =>
 							setting.addToggle((t) =>
 								t.setValue(s.syncHidden).onChange(async (v) => {
 									s.syncHidden = v;
 									await this.plugin.saveSettings();
-									this.update(); // swap between the exclude / include list
 								})
 							)
 					),
-					// ON: blacklist — everything hidden syncs except these
+					// The general blacklist. Always visible, because it always applies —
+					// to normal notes and attachments just as much as to hidden files.
 					row(
-						"…except these",
-						"One path per line. These hidden files/folders are NOT synced. Everything else hidden is.",
+						"Do not sync these",
+						"One path per line. These files and folders are never synced — on any device. " +
+							"A line ending in / matches that folder at any depth, so node_modules/ also " +
+							"covers Projects/app/node_modules/.",
 						(setting) =>
 							setting.addTextArea((t) => {
-								t.setValue(s.hiddenExclude.join("\n")).onChange(async (v) => {
-									s.hiddenExclude = v.split("\n").map((x) => x.trim()).filter((x) => x.length > 0);
+								t.setValue(s.syncExclude.join("\n")).onChange(async (v) => {
+									s.syncExclude = splitLines(v);
 									await this.plugin.saveSettings();
 								});
 								t.inputEl.rows = 8;
-							}),
-						{ visible: () => this.plugin.settings.syncHidden }
+							})
 					),
-					// OFF: whitelist — nothing hidden syncs except these
+					// The narrow opt-in. It beats BOTH the list above and the toggle, which
+					// is the only way to say "from this excluded area I want exactly one thing".
 					row(
-						"…but still sync these",
-						"One path per line. Hidden files are skipped — list any you DO want synced " +
-							`(e.g. ${cfg}/snippets/). Leave empty to skip all hidden files.`,
+						"Sync these anyway",
+						"One path per line, and these win: anything listed here is synced even when " +
+							`it is hidden or excluded above (e.g. ${cfg}/snippets/). Leave empty if you ` +
+							"do not need an exception.",
 						(setting) =>
 							setting.addTextArea((t) => {
-								t.setValue(s.hiddenInclude.join("\n")).onChange(async (v) => {
-									s.hiddenInclude = v.split("\n").map((x) => x.trim()).filter((x) => x.length > 0);
+								t.setValue(s.syncInclude.join("\n")).onChange(async (v) => {
+									s.syncInclude = splitLines(v);
 									await this.plugin.saveSettings();
 								});
 								t.inputEl.rows = 4;
-							}),
-						{ visible: () => !this.plugin.settings.syncHidden }
+							})
 					),
 				],
 			},
@@ -595,32 +653,41 @@ export class CouchDBSyncSettingTab extends PluginSettingTab {
 							"orphaned data, the entire version history. Drops the whole database if your account " +
 							"is allowed to; otherwise it deletes every document instead, which needs no more " +
 							"rights than syncing. Use this when the server state is wrong and this vault is the " +
-							"copy you trust.",
+							"copy you trust. " +
+							"It is also how you change your encryption passphrase: switch sync off, enter the new " +
+							"passphrase above, then reset — every file is re-uploaded under the new key. The new " +
+							"passphrase then has to be entered on every other device by hand, followed by " +
+							"“Wipe local cache” there.",
 						(setting) =>
 							setting.addButton((b) =>
 								b
 									.setDestructive()
 									.setButtonText("Reset server")
-									.onClick(() => {
-										confirm(this.app, {
-											title: "Delete everything on the server?",
-											body:
-												"The database on the server is deleted and rebuilt from this device: " +
-												`${this.plugin.settings.dbName} on ${this.plugin.settings.serverUrl}.\n\n` +
-												"Gone for good: every file version in the history, and anything that " +
-												"exists ONLY on the server (files no longer on this device are not " +
-												"restored). Your notes on this device are not touched.\n\n" +
-												"Every other device still holds a copy of the old database and will " +
-												"push it back when it syncs. On each of them: switch sync off now, " +
-												"and run “Wipe local cache” before switching it on again.",
-											cta: "Delete and re-upload",
-											danger: true,
-											onConfirm: async () => {
-												new Notice("Emptying the server and re-uploading…");
-												await this.plugin.resetServerFromLocal();
-												this.update();
-											},
-										});
+									.onClick(async () => {
+										// Measure the damage BEFORE asking. The scan is a network
+										// round-trip, so the button says what it is doing meanwhile.
+										b.setButtonText("Checking the server…").setDisabled(true);
+										let pre: ResetPreflight;
+										try {
+											pre = await this.plugin.previewServerReset();
+										} catch (e) {
+											// A check that fails must reach the "could not check"
+											// dialog, never disappear and leave the button dead.
+											pre = {
+												checked: false,
+												reason: e instanceof Error ? e.message : String(e),
+											};
+										} finally {
+											b.setButtonText("Reset server").setDisabled(false);
+										}
+										// Nothing to lose → today's dialog, one click, unchanged. A
+										// guard that fires every time gets clicked away every time,
+										// including the time it mattered.
+										if (pre.checked && pre.delta.equal && pre.unreadable === 0) {
+											this.confirmServerReset();
+											return;
+										}
+										this.confirmResetDelta(pre);
 									})
 							)
 					),
@@ -678,4 +745,69 @@ export class CouchDBSyncSettingTab extends PluginSettingTab {
 			},
 		];
 	}
+}
+
+/** How many paths a delta list names before it collapses into "…and N more". */
+const DELTA_LIST_LIMIT = 12;
+
+/**
+ * The "Reset server" delta: how big each side is, and — the part that matters —
+ * which files exist only on the server, because those are the ones the reset
+ * destroys.
+ *
+ * The two sets are kept visually apart on purpose. Both count as a difference; only
+ * one of them is damage. Files that exist only on this device are uploaded again a
+ * moment later, and presenting them next to a real loss would train the user to read
+ * past the whole dialog.
+ */
+function renderResetDelta(el: HTMLElement, pre: { delta: PathDelta; unreadable: number }): void {
+	const { delta } = pre;
+	el.addClass("couchdb-sync-reset-delta");
+
+	// Counts side by side with a proportional bar, so the size of the gap is legible
+	// without reading the numbers.
+	const scale = Math.max(delta.serverCount, delta.diskCount, 1);
+	const bar = (label: string, count: number, cls: string) => {
+		const rowEl = el.createDiv({ cls: "couchdb-sync-delta-row" });
+		rowEl.createSpan({ text: label, cls: "couchdb-sync-delta-label" });
+		const track = rowEl.createDiv({ cls: "couchdb-sync-delta-track" });
+		const fill = track.createDiv({ cls: `couchdb-sync-delta-fill ${cls}` });
+		// The one genuinely dynamic value here; everything else is in styles.css.
+		fill.setCssStyles({ width: `${Math.round((count / scale) * 100)}%` });
+		rowEl.createSpan({ text: `${count} files`, cls: "couchdb-sync-delta-count" });
+	};
+	bar("Server", delta.serverCount, "is-server");
+	bar("This device", delta.diskCount, "is-disk");
+
+	const list = (title: string, paths: string[], cls: string) => {
+		if (paths.length === 0) return;
+		const box = el.createDiv({ cls: `couchdb-sync-delta-list ${cls}` });
+		box.createDiv({ text: `${title} (${paths.length})`, cls: "couchdb-sync-delta-list-title" });
+		const ul = box.createEl("ul");
+		for (const p of paths.slice(0, DELTA_LIST_LIMIT)) ul.createEl("li", { text: p });
+		if (paths.length > DELTA_LIST_LIMIT) {
+			ul.createEl("li", {
+				text: `…and ${paths.length - DELTA_LIST_LIMIT} more`,
+				cls: "couchdb-sync-delta-more",
+			});
+		}
+	};
+	list("Only on the server — deleted, and not restored", delta.serverOnly, "is-loss");
+	if (pre.unreadable > 0) {
+		el.createDiv({
+			cls: "couchdb-sync-delta-warn",
+			text:
+				`${pre.unreadable} more file(s) on the server could not be decrypted, so they are not ` +
+				"listed above. They are deleted too.",
+		});
+	}
+	list("Only on this device — uploaded again, so not lost", delta.localOnly, "is-safe");
+}
+
+/** One path per line, trimmed, blanks dropped — the shape both path lists persist in. */
+function splitLines(value: string): string[] {
+	return value
+		.split("\n")
+		.map((x) => x.trim())
+		.filter((x) => x.length > 0);
 }

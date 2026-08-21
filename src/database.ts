@@ -20,6 +20,17 @@ import { base64ToUint8, toError, uint8ToBase64 } from "./util";
 
 const RANGE_END = "￿";
 
+/** PouchDB's own marker: documents under this prefix are never replicated. */
+const LOCAL_DOC_PREFIX = "_local/";
+
+function assertLocalId(id: string, method: string): void {
+	if (!id.startsWith(LOCAL_DOC_PREFIX)) {
+		throw new Error(
+			`${method}: "${id}" is not a ${LOCAL_DOC_PREFIX} id and would replicate — use the shared variant`
+		);
+	}
+}
+
 /** A chunk's decrypted-or-raw bytes plus whether they are encrypted. */
 export interface ChunkBytes {
 	enc: boolean;
@@ -761,9 +772,20 @@ export class SyncDatabase {
 		this.remote = fresh;
 	}
 
-	// --- per-device local state (not replicated) ---------------------------
+	// --- small documents: per-device state and shared metadata ---------------
 
+	/**
+	 * Read a per-device document. Asserts the prefix for the same reason the write
+	 * side splits in two: whether a document replicates is decided by its id alone,
+	 * and a method with "Local" in its name must not be the place that quietly
+	 * decides otherwise.
+	 */
 	async getLocalDoc<T>(id: string): Promise<T | null> {
+		assertLocalId(id, "getLocalDoc");
+		return this.getDocById<T>(id);
+	}
+
+	private async getDocById<T>(id: string): Promise<T | null> {
 		try {
 			return (await this.withLocal((db) => db.get(id))) as unknown as T;
 		} catch (e) {
@@ -772,15 +794,9 @@ export class SyncDatabase {
 		}
 	}
 
-	/**
-	 * Upsert a document by id (read-then-write to attach the current _rev). NOTE: the
-	 * "Local" in the name means "written on the local replica", NOT "non-replicating".
-	 * Whether it replicates depends on the id: ids starting with "_local/" (the sync
-	 * state and origin fingerprint) stay per-device; any other id (e.g. the master
-	 * info doc "couchdb-sync:masterinfo") is a normal doc and DOES replicate.
-	 */
-	async putLocalDoc(id: string, value: Record<string, unknown>): Promise<void> {
-		const existing = (await this.getLocalDoc<{ _rev?: string }>(id)) ?? {};
+	/** Upsert by id, reading the current _rev first so the write lands on top of it. */
+	private async upsert(id: string, value: Record<string, unknown>): Promise<void> {
+		const existing = (await this.getDocById<{ _rev?: string }>(id)) ?? {};
 		await this.withLocal((local) =>
 			(local as unknown as PouchDB.Database).put({
 				...value,
@@ -788,6 +804,33 @@ export class SyncDatabase {
 				_rev: existing._rev,
 			})
 		);
+	}
+
+	/**
+	 * Write a document that stays on THIS device. PouchDB decides that by the id, not
+	 * by the method: only ids under "_local/" are exempt from replication.
+	 *
+	 * The prefix is therefore asserted rather than assumed. Before this split there
+	 * was one `putLocalDoc` used for both kinds, and the master-info document — whose
+	 * id has no prefix — replicated to the server while the call read as local. The
+	 * concrete leak that caused (a cleartext device id on the server) is long fixed,
+	 * but the name still invited the next caller to make the same assumption.
+	 */
+	async putLocalDoc(id: string, value: Record<string, unknown>): Promise<void> {
+		assertLocalId(id, "putLocalDoc");
+		await this.upsert(id, value);
+	}
+
+	/**
+	 * Write a document that DOES replicate to the server and every other device.
+	 * Deliberately not "local": the master-info document is shared state, and every
+	 * caller should have to say so.
+	 */
+	async putSharedDoc(id: string, value: Record<string, unknown>): Promise<void> {
+		if (id.startsWith(LOCAL_DOC_PREFIX)) {
+			throw new Error(`putSharedDoc: "${id}" is a ${LOCAL_DOC_PREFIX} id and cannot replicate`);
+		}
+		await this.upsert(id, value);
 	}
 
 	async close(): Promise<void> {

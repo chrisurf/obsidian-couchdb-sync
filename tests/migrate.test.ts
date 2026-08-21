@@ -1,6 +1,6 @@
 import { describe, it, expect } from "vitest";
 import { migrateSettings } from "../src/migrate";
-import { CouchDBSyncSettings, DEFAULT_SETTINGS, defaultHiddenExclude } from "../src/types";
+import { CouchDBSyncSettings, DEFAULT_SETTINGS, defaultExclude } from "../src/types";
 
 /** The usual configuration folder; migrateSettings takes it from Vault#configDir. */
 const CONFIG_DIR = ".obsidian";
@@ -19,12 +19,12 @@ describe("migrateSettings (v1)", () => {
 		});
 		const changed = migrateSettings(s, 0, CONFIG_DIR);
 		expect(changed).toBe(true);
-		expect(s.hiddenExclude).toContain(".git/");
-		expect(s.hiddenExclude).toContain(".obsidian/");
+		expect(s.syncExclude).toContain(".git/");
+		expect(s.syncExclude).toContain(".obsidian/");
 		// user's own extra entries are preserved
-		expect(s.hiddenExclude).toContain(".DS_Store");
+		expect(s.syncExclude).toContain(".DS_Store");
 		// no duplicates introduced
-		expect(new Set(s.hiddenExclude).size).toBe(s.hiddenExclude.length);
+		expect(new Set(s.syncExclude).size).toBe(s.syncExclude.length);
 	});
 
 	it("excludes a RENAMED configuration folder, not the hardcoded .obsidian", () => {
@@ -33,10 +33,10 @@ describe("migrateSettings (v1)", () => {
 		// settings directory. The real name comes from Vault#configDir.
 		const s = merged({ syncHidden: true, hiddenExclude: [] });
 		expect(migrateSettings(s, 0, "my-config")).toBe(true);
-		expect(s.hiddenExclude).toContain("my-config/");
-		expect(s.hiddenExclude).not.toContain(".obsidian/");
+		expect(s.syncExclude).toContain("my-config/");
+		expect(s.syncExclude).not.toContain(".obsidian/");
 		// folder-independent entries are still applied
-		expect(s.hiddenExclude).toContain(".git/");
+		expect(s.syncExclude).toContain(".git/");
 	});
 
 	it("strips the dead excludePatterns / ignorePatterns keys", () => {
@@ -51,16 +51,17 @@ describe("migrateSettings (v1)", () => {
 	});
 
 	it("is a no-op for a config that already has the full default baseline and no dead keys", () => {
-		const s = merged({ hiddenExclude: defaultHiddenExclude(CONFIG_DIR) });
+		// Already v7-shaped (no legacy key), so nothing to rename either.
+		const s = merged({ syncExclude: defaultExclude(CONFIG_DIR) });
 		expect(migrateSettings(s, 0, CONFIG_DIR)).toBe(false);
 	});
 
 	it("does not run v1 changes when priorVersion is already >= 1 (respects later user edits)", () => {
 		// A user who deliberately removed .git/ AFTER migrating must not have it re-added.
-		const s = merged({ hiddenExclude: [".DS_Store"], excludePatterns: ["leftover"] });
-		const changed = migrateSettings(s, 1, CONFIG_DIR);
+		const s = merged({ syncExclude: [".DS_Store"], excludePatterns: ["leftover"] });
+		const changed = migrateSettings(s, 7, CONFIG_DIR);
 		expect(changed).toBe(false);
-		expect(s.hiddenExclude).toEqual([".DS_Store"]);
+		expect(s.syncExclude).toEqual([".DS_Store"]);
 		expect("excludePatterns" in s).toBe(true); // gated: not touched at v>=1
 	});
 
@@ -127,7 +128,7 @@ describe("migrateSettings (v2) — autoStart folded into syncEnabled", () => {
 			excludePatterns: ["dead"],
 		});
 		expect(migrateSettings(s, 0, CONFIG_DIR)).toBe(true);
-		expect(s.hiddenExclude).toContain(".git/");
+		expect(s.syncExclude).toContain(".git/");
 		expect("excludePatterns" in s).toBe(false);
 		expect(s.syncEnabled).toBe(false);
 		expect("autoStart" in s).toBe(false);
@@ -173,6 +174,52 @@ describe("migrateSettings (v4) — live sync is always on", () => {
 		const s = merged({ liveSync: false });
 		expect(migrateSettings(s, 4, CONFIG_DIR)).toBe(false);
 		expect(s.liveSync).toBe(false);
+	});
+});
+
+describe("migrateSettings (v7) — the path lists stop being hidden-only", () => {
+	it("carries a pre-v7 config's entries over verbatim and drops the old keys", () => {
+		// The point of the migration: the SAME entries, now applied to every path.
+		// Nothing is added (no re-union of the defaults) and nothing is removed.
+		const s = merged({
+			hiddenExclude: [".DS_Store", "node_modules/", "tmp/"],
+			hiddenInclude: [".obsidian/snippets/"],
+		});
+		const changed = migrateSettings(s, 6, CONFIG_DIR);
+		expect(changed).toBe(true);
+		expect(s.syncExclude).toEqual([".DS_Store", "node_modules/", "tmp/"]);
+		expect(s.syncInclude).toEqual([".obsidian/snippets/"]);
+		expect("hiddenExclude" in s).toBe(false);
+		expect("hiddenInclude" in s).toBe(false);
+	});
+
+	it("keeps a deliberately emptied list empty instead of restoring the defaults", () => {
+		const s = merged({ hiddenExclude: [], hiddenInclude: [] });
+		migrateSettings(s, 6, CONFIG_DIR);
+		expect(s.syncExclude).toEqual([]);
+		expect(s.syncInclude).toEqual([]);
+	});
+
+	it("ignores a corrupted list rather than carrying garbage into the skip rules", () => {
+		const s = merged({ hiddenExclude: "node_modules/", hiddenInclude: [1, ".x/"] });
+		migrateSettings(s, 6, CONFIG_DIR);
+		expect(s.syncExclude).toEqual([]);
+		expect(s.syncInclude).toEqual([".x/"]);
+	});
+
+	it("does not touch an already-v7 config", () => {
+		const s = merged({ syncExclude: [".DS_Store"], syncInclude: [] });
+		expect(migrateSettings(s, 7, CONFIG_DIR)).toBe(false);
+		expect(s.syncExclude).toEqual([".DS_Store"]);
+	});
+
+	it("runs the rename BEFORE v1, so a version-0 config is unioned into the new key", () => {
+		const s = merged({ hiddenExclude: [".DS_Store"] });
+		expect(migrateSettings(s, 0, CONFIG_DIR)).toBe(true);
+		expect("hiddenExclude" in s).toBe(false);
+		expect(s.syncExclude).toContain(".DS_Store"); // the user's own entry survives
+		expect(s.syncExclude).toContain(".git/"); // and v1's baseline lands in the new key
+		expect(s.syncExclude).toContain(`${CONFIG_DIR}/`);
 	});
 });
 

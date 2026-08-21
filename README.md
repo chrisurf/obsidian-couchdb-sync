@@ -146,6 +146,30 @@ That gives you `http://127.0.0.1:5984` with user `admin` and password
 `password` — perfect for trying things out on one computer. Change that password
 and use `https://` before you sync anything real over the internet.
 
+**Option C — keep your server off the open internet (Cloudflare Tunnel).** If you
+run CouchDB at home but would rather not forward a port or hand out your IP
+address, a [Cloudflare Tunnel](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/)
+puts a public hostname in front of it. `cloudflared` runs next to CouchDB and
+dials *out*, so your router needs no inbound rule, and the certificate is handled
+for you:
+
+```bash
+cloudflared tunnel create obsidian
+cloudflared tunnel route dns obsidian couch.example.com
+cloudflared tunnel run --url http://127.0.0.1:5984 obsidian
+```
+
+Then enter `https://couch.example.com` as the web address in Step 2. There is no
+setting for this in the plugin — the tunnel is invisible to it.
+
+> ⚠️ **A tunnel hides where your server is; it does not lock the door.** Anyone
+> who knows the hostname reaches your CouchDB, so `require_valid_user = true`
+> below and a strong password are what actually protect it.
+>
+> Do **not** put a Cloudflare Access policy in front of the hostname: Access
+> answers unauthenticated requests with a login page rather than your data, and
+> the plugin cannot present a service token yet. Sync would stop working.
+
 **One-time server setting.** However you got your server, open its configuration
 and add this. It lets Obsidian talk to it and allows large files:
 
@@ -248,16 +272,47 @@ Available from Obsidian's command palette (`Ctrl/Cmd + P`).
 | Where credentials are kept | this device | What unlocks the encrypted password/passphrase in `data.json`: a key held on this device only, or a passphrase asked at every launch |
 | Conflict strategy | newest wins | Who wins when two devices edit the same note |
 | This device is the master | off | With *master wins*: this device's version always wins. Turn on for exactly one device |
-| Sync hidden files | off | Also sync `.obsidian` (your settings, themes, plugins), `.git`, etc. |
-| …except these | a safe default list | With hidden sync on: which hidden folders to leave out |
-| …but still sync these | _(empty)_ | With hidden sync off: which hidden folders to include anyway |
+| Sync hidden files | off | Also sync `.obsidian` (your settings, themes, plugins), `.git`, etc. The two lists below apply either way |
+| Do not sync these | a safe default list | One path per line, never synced — notes and attachments included. A line ending in `/` matches that folder at any depth, so `node_modules/` also covers `Projects/app/node_modules/` |
+| Sync these anyway | _(empty)_ | One path per line, and these win: synced even when hidden or excluded above (e.g. `.obsidian/snippets/`) |
 | Download from server | — | **Server wins here:** overwrite this device's files with the server's version and fetch anything missing. Uploads nothing; local-only files are kept; any overwritten edit is saved to history |
 | Upload to server | — | **This device wins on the server:** overwrite the server's copy of every file with this device's, and add local-only files. Server-only files are kept (not deleted). Affects every other device |
 | Wipe local cache | — | Deletes this device's copy. The server is not touched |
 
-> **Changing the passphrase changes how everything is stored.** If you change the
-> passphrase, wipe the local cache and start from a fresh, empty database —
-> otherwise old and new notes get mixed and neither side can read the other.
+| Reset the server from this device | — | **Start the server over:** delete everything on it and re-upload this device's files. Checks the server first and names the files that exist only there — the ones the reset destroys — before asking. Also how you change your passphrase (below) |
+
+### 🔁 Changing your passphrase
+
+Your passphrase is not a login you can just replace — it is the key everything on the
+server was locked with, *and* it decides the names your files are filed under. Change
+it and the server's existing contents become unreadable to you. So the passphrase is
+not changed so much as the server is rebuilt around the new one.
+
+On the device whose files you trust:
+
+1. **Switch sync off** (the toggle in the status panel). Do this *first* — the
+   passphrase field saves on every keystroke, and a sync running in the background
+   would upload files locked with a half-typed passphrase.
+2. **Enter the new passphrase** under *Connection & encryption*.
+3. Press **Reset server** under *Actions*, and confirm. It empties the server, discards
+   this device's cache and re-uploads every file under the new passphrase. Sync turns
+   itself back on. Expect an extra dialog here saying the server's files cannot be read
+   with this passphrase — that is exactly right: the new key cannot open the old
+   contents, so the plugin cannot list what the reset will delete. Continue.
+4. Wait until the counters read the same number three times over — e.g.
+   `112 / 112 local · 112 / 112 on server`.
+
+**The new passphrase has to be entered on every other device by hand.** On each one:
+switch sync off, type in the same passphrase, press **Wipe local cache**, and switch
+sync back on. It downloads the vault afresh.
+
+> ⚠️ **The version history does not survive this.** The reset deletes everything on the
+> server, past versions included, and files that existed *only* on the server are gone
+> too — only the device you reset from is preserved. Copy anything you still need off
+> the other devices first.
+>
+> A device you forget will keep the old passphrase, fail to read anything, and can push
+> its old copy back. Work through all of them.
 
 ---
 

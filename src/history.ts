@@ -3,17 +3,35 @@ import type CouchDBSyncPlugin from "./main";
 import { VersionDoc } from "./types";
 import { diffLines } from "./util";
 
+/**
+ * What a confirm dialog needs to know. `body` is the prose; `detail` is an optional
+ * render hook for a dialog that has to SHOW something — the "Reset server"
+ * pre-flight lists the files the reset would destroy, and a plain string cannot
+ * carry a list or a bar chart.
+ *
+ * The hook exists instead of a second modal class on purpose: two destructive
+ * dialogs that look different is a worse outcome than either of them alone.
+ */
+export interface ConfirmOptions {
+	title: string;
+	body: string;
+	/** extra content rendered under the body, e.g. a delta the user must weigh */
+	detail?: (el: HTMLElement) => void;
+	cta: string;
+	danger?: boolean;
+	/**
+	 * Focus Cancel rather than leaving focus on the dialog. For a dialog whose
+	 * default answer should be "no" — a stray Enter must not delete a server.
+	 */
+	focusCancel?: boolean;
+	onConfirm: () => void | Promise<void>;
+}
+
 /** Minimal confirm dialog for irreversible actions. No native pop-ups elsewhere. */
 export class ConfirmModal extends Modal {
 	constructor(
 		app: App,
-		private opts: {
-			title: string;
-			body: string;
-			cta: string;
-			danger?: boolean;
-			onConfirm: () => void | Promise<void>;
-		}
+		private opts: ConfirmOptions
 	) {
 		super(app);
 	}
@@ -22,9 +40,13 @@ export class ConfirmModal extends Modal {
 		const { contentEl } = this;
 		contentEl.addClass("couchdb-sync-confirm");
 		contentEl.createEl("h3", { text: this.opts.title });
-		contentEl.createEl("p", { text: this.opts.body, cls: "couchdb-sync-confirm-body" });
+		if (this.opts.body) {
+			contentEl.createEl("p", { text: this.opts.body, cls: "couchdb-sync-confirm-body" });
+		}
+		this.opts.detail?.(contentEl.createDiv({ cls: "couchdb-sync-confirm-detail" }));
 		const row = contentEl.createDiv({ cls: "couchdb-sync-modal-buttons" });
-		row.createEl("button", { text: "Cancel" }).onclick = () => this.close();
+		const cancel = row.createEl("button", { text: "Cancel" });
+		cancel.onclick = () => this.close();
 		const ok = row.createEl("button", {
 			text: this.opts.cta,
 			cls: this.opts.danger ? "mod-warning" : "mod-cta",
@@ -33,6 +55,7 @@ export class ConfirmModal extends Modal {
 			this.close();
 			await this.opts.onConfirm();
 		};
+		if (this.opts.focusCancel) cancel.focus();
 	}
 
 	onClose(): void {
@@ -40,10 +63,7 @@ export class ConfirmModal extends Modal {
 	}
 }
 
-export function confirm(
-	app: App,
-	opts: { title: string; body: string; cta: string; danger?: boolean; onConfirm: () => void | Promise<void> }
-): void {
+export function confirm(app: App, opts: ConfirmOptions): void {
 	new ConfirmModal(app, opts).open();
 }
 

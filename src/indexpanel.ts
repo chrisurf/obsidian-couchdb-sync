@@ -712,11 +712,11 @@ export class IndexPanel {
 			toggleBox.empty();
 			if (report.excluded.length > 0) {
 				new Setting(toggleBox)
-					.setName(`Show ${report.excluded.length} excluded hidden file(s)`)
+					.setName(`Show ${report.excluded.length} excluded file(s)`)
 					.setDesc(
-						`Hidden files (dot-folders like ${this.plugin.app.vault.configDir} or .git) that are ` +
-						"skipped by your sync rules. Turn on to reveal them in the Disk tree above so you " +
-						"can sync individual files once."
+						`Files your sync rules skip — hidden ones (dot-folders like ${this.plugin.app.vault.configDir} ` +
+						"or .git) and anything on the “Do not sync these” list, such as node_modules/. " +
+						"Turn on to reveal them in the Disk tree above so you can sync individual files once."
 					)
 					.addToggle((t) =>
 						t.setValue(this.plugin.settings.showExcluded).onChange(async (v) => {

@@ -189,11 +189,44 @@ export function matchesIgnore(path: string, patterns: string[]): boolean {
 	});
 }
 
-/** The subset of settings that decides which hidden paths are in scope. */
-export interface HiddenScanRules {
+/** The subset of settings that decides which paths are in scope for syncing. */
+export interface SkipRules {
 	syncHidden: boolean;
-	hiddenExclude: string[];
-	hiddenInclude: string[];
+	/** "Do not sync these" — applies to EVERY path, hidden or not. */
+	syncExclude: string[];
+	/** "Sync these anyway" — the narrow opt-in that beats both of the above. */
+	syncInclude: string[];
+}
+
+/**
+ * Is this path out of scope for syncing?
+ *
+ * One rule, in one place, for every file in the vault:
+ *
+ *   **exclude wins, unless the path is explicitly re-included.**
+ *
+ * That is the `.gitignore` model with a negation, which is the mental model most
+ * users already have. Concretely, in order:
+ *
+ * 1. `syncInclude` — an explicit opt-in. It overrides everything below it, because a
+ *    blacklist cannot express "from this excluded area I want exactly one thing":
+ *    `<configDir>/snippets/` is one line here, while saying the same with exclusions
+ *    means enumerating every other plugin folder — a list that is never finished,
+ *    since each newly installed plugin adds one more to forget.
+ * 2. `syncExclude` — the general blacklist. It used to be consulted only for hidden
+ *    paths, which made its own defaults a lie: `node_modules/` did nothing for
+ *    `Projects/app/node_modules/`, and a vault holding one Node project had no
+ *    setting anywhere that could stop it syncing tens of thousands of files.
+ * 3. the hidden toggle — anything with a dot segment is skipped unless
+ *    `syncHidden` is on.
+ *
+ * Nothing here deletes: a newly excluded file stops being pushed, stays on every
+ * disk, and shows in the tree as *excluded*. Removing the line brings it back.
+ */
+export function isPathExcluded(path: string, rules: SkipRules): boolean {
+	if (matchesIgnore(path, rules.syncInclude)) return false;
+	if (matchesIgnore(path, rules.syncExclude)) return true;
+	return isHidden(path) ? !rules.syncHidden : false;
 }
 
 /**
@@ -209,18 +242,84 @@ export interface HiddenScanRules {
  * skipped, which holds because both ignore forms are prefix-based: if a pattern
  * matches "<dir>/", it matches "<dir>/<anything>" too.
  *
+ * - an include pattern pointing AT or INTO the folder always wins, mirroring the
+ *   override in {@link isPathExcluded} — otherwise the one way to re-enable a single
+ *   path inside an excluded area would be pruned before it is ever considered.
  * - hidden sync ON (blacklist): skip the subtree when the folder itself is excluded.
  * - hidden sync OFF (whitelist): only descend when some include pattern points at
  *   this folder or below it — everything else is skipped anyway.
  */
-export function shouldWalkHiddenDir(dir: string, rules: HiddenScanRules): boolean {
+export function shouldWalkHiddenDir(dir: string, rules: SkipRules): boolean {
 	const withSlash = dir.endsWith("/") ? dir : dir + "/";
+	if (pointsInto(withSlash, rules.syncInclude)) return true;
 	if (rules.syncHidden) {
-		return !matchesIgnore(withSlash, rules.hiddenExclude);
+		return !matchesIgnore(withSlash, rules.syncExclude);
 	}
-	return rules.hiddenInclude.some(
-		(p) => !!p && (p.startsWith(withSlash) || matchesIgnore(withSlash, [p]))
+	return false;
+}
+
+/** Does any pattern name this folder, sit inside it, or cover it? */
+function pointsInto(dirWithSlash: string, patterns: string[]): boolean {
+	return patterns.some(
+		(p) => !!p && (p.startsWith(dirWithSlash) || matchesIgnore(dirWithSlash, [p]))
 	);
+}
+
+/**
+ * Is there any reason to walk hidden files at all?
+ *
+ * The walk is expensive (serial `adapter.list()` calls) and used to be gated on
+ * `syncHidden` alone — which quietly made the include list inert in the one mode it
+ * was written for: with the toggle off, nothing hidden was ever listed, so
+ * "sync these anyway" pushed nothing. A hidden include entry is now reason enough
+ * to walk; a normal one (re-including a path under an excluded folder) is not,
+ * because those files arrive through `Vault#getFiles()` anyway.
+ */
+export function needsHiddenScan(rules: SkipRules): boolean {
+	return rules.syncHidden || rules.syncInclude.some((p) => !!p && isHidden(p));
+}
+
+/**
+ * What separates the server's contents from this device's disk. Produced by
+ * {@link comparePaths} and shown before "Reset server" empties the remote database.
+ */
+export interface PathDelta {
+	/** the two sides hold exactly the same paths — the reset destroys nothing */
+	equal: boolean;
+	/** on the server, not on this disk — the set the reset actually destroys */
+	serverOnly: string[];
+	/** on this disk, not on the server — uploaded again afterwards, so not a loss */
+	localOnly: string[];
+	serverCount: number;
+	diskCount: number;
+}
+
+/**
+ * Compare the server's paths with this device's, for the pre-flight in front of
+ * "Reset server". Pure, so the one decision that costs data if it is wrong can be
+ * tested without a database or an Obsidian app.
+ *
+ * The disk side is deliberately the DISK and not the local cache: the re-upload
+ * that follows a reset walks `Vault#getFiles()`, so what survives is what is on
+ * disk. `IndexReport.serverOnly` is computed against the cache and answers a
+ * different question.
+ *
+ * Duplicates on either side are collapsed, and the counts report distinct paths, so
+ * the two figures shown side by side are comparable.
+ */
+export function comparePaths(serverPaths: string[], diskPaths: string[]): PathDelta {
+	const server = new Set(serverPaths);
+	const disk = new Set(diskPaths);
+	const sort = (a: string[]) => a.sort((x, y) => x.localeCompare(y));
+	const serverOnly = sort([...server].filter((p) => !disk.has(p)));
+	const localOnly = sort([...disk].filter((p) => !server.has(p)));
+	return {
+		equal: serverOnly.length === 0 && localOnly.length === 0,
+		serverOnly,
+		localOnly,
+		serverCount: server.size,
+		diskCount: disk.size,
+	};
 }
 
 /** One block of a line-by-line diff: unchanged context, or a changed region. */

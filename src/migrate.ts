@@ -1,4 +1,4 @@
-import { CouchDBSyncSettings, defaultHiddenExclude } from "./types";
+import { CouchDBSyncSettings, defaultExclude } from "./types";
 
 /**
  * Pure, idempotent settings migration. Mutates the given (already default-merged)
@@ -37,7 +37,27 @@ import { CouchDBSyncSettings, defaultHiddenExclude } from "./types";
  * the version bump is recorded and the save that performs the sealing is triggered.
  * Note for users: this cleans the CURRENT data.json only; older backups of it still
  * contain the plaintext credentials.
+ *
+ * v7: the two path lists stop being hidden-only. `hiddenExclude` becomes
+ * `syncExclude`, checked for EVERY path, and `hiddenInclude` becomes `syncInclude`,
+ * the opt-in that overrides it. The entries are carried over verbatim — nothing is
+ * added and nothing is dropped — but they now reach further: a config listing `tmp/`
+ * stops syncing `Notes/tmp/` as well, and the `node_modules/` line that only ever
+ * matched inside a hidden folder finally covers `Projects/app/node_modules/`. That
+ * is the point of the change; recording it as a schema bump is what keeps it from
+ * happening quietly. Nothing is deleted anywhere: a newly excluded file stops being
+ * pushed, stays on every disk, and appears in the tree as *excluded* — removing the
+ * line brings it straight back.
  */
+/** Pre-v7 names of the two path lists (see the v7 note above). */
+const LEGACY_EXCLUDE = "hiddenExclude";
+const LEGACY_INCLUDE = "hiddenInclude";
+
+/** A persisted value we only trust once it looks like the list it claims to be. */
+function asStringArray(value: unknown): string[] {
+	return Array.isArray(value) ? value.filter((x): x is string => typeof x === "string") : [];
+}
+
 export function migrateSettings(
 	settings: CouchDBSyncSettings & Record<string, unknown>,
 	priorVersion: number,
@@ -45,13 +65,34 @@ export function migrateSettings(
 ): boolean {
 	let changed = false;
 
+	// v7, deliberately FIRST although it is the newest step: it renames the two path
+	// lists, and the v1 step below edits one of them. Normalizing the names up front
+	// means every step after this one sees exactly one spelling — and makes the whole
+	// function idempotent, which it would not be if v1 could re-create a key v7 had
+	// already renamed away.
+	if (priorVersion < 7) {
+		// The exclude list applies to every path now, and the include list overrides it
+		// — so both outgrew their "hidden" names. The entries are carried across
+		// verbatim; only their reach changes.
+		for (const [legacy, current] of [
+			[LEGACY_EXCLUDE, "syncExclude"],
+			[LEGACY_INCLUDE, "syncInclude"],
+		] as const) {
+			if (legacy in settings) {
+				settings[current] = asStringArray(settings[legacy]);
+				delete settings[legacy];
+				changed = true;
+			}
+		}
+	}
+
 	if (priorVersion < 1) {
 		// (a) union the default excludes into whatever the user already has
-		const have = new Set(settings.hiddenExclude ?? []);
+		const have = new Set(settings.syncExclude ?? []);
 		const before = have.size;
-		for (const p of defaultHiddenExclude(configDir)) have.add(p);
+		for (const p of defaultExclude(configDir)) have.add(p);
 		if (have.size !== before) {
-			settings.hiddenExclude = [...have];
+			settings.syncExclude = [...have];
 			changed = true;
 		}
 
