@@ -16,7 +16,7 @@ export type SecretsMode = "device" | "ask";
  * that needs a one-time migration (see `migrateSettings` in main.ts). Fresh
  * installs are stamped with the current version and skip migration.
  */
-export const CURRENT_SETTINGS_VERSION = 6;
+export const CURRENT_SETTINGS_VERSION = 7;
 
 export interface CouchDBSyncSettings {
 	/** persisted settings schema version; drives one-time migrations */
@@ -94,16 +94,31 @@ export interface CouchDBSyncSettings {
 	liveSync: boolean;
 
 	/**
-	 * Sync hidden files (dotfiles and dot-folders like .obsidian, .git). Normal files
-	 * are always synced. Our own plugin's data.json is always excluded.
+	 * Sync hidden files (dotfiles and dot-folders like .obsidian, .git). Off by
+	 * default. Our own plugin's data.json is always excluded.
+	 *
+	 * This decides only what happens to HIDDEN paths; `syncExclude` applies either
+	 * way. See `isPathExcluded` in util.ts for the single rule that combines the two.
 	 */
 	syncHidden: boolean;
 
-	/** when syncHidden is ON: hidden paths to NOT sync (blacklist) */
-	hiddenExclude: string[];
+	/**
+	 * "Do not sync these" — paths that are never synced, hidden or not.
+	 *
+	 * Persisted as `hiddenExclude` before schema v7, when it was consulted only for
+	 * hidden paths. That made its own defaults inert: `node_modules/` matched nothing
+	 * under `Projects/app/`, and a vault holding a Node project had no setting that
+	 * could stop it. Migration v7 carries the entries over unchanged; they simply
+	 * reach further now.
+	 */
+	syncExclude: string[];
 
-	/** when syncHidden is OFF: hidden paths to sync anyway (whitelist) */
-	hiddenInclude: string[];
+	/**
+	 * "Sync these anyway" — the narrow opt-in. Overrides `syncExclude` AND the hidden
+	 * toggle, because a blacklist cannot express "from this excluded area I want
+	 * exactly one thing". Persisted as `hiddenInclude` before schema v7.
+	 */
+	syncInclude: string[];
 
 	/**
 	 * How many past versions to keep per file in the explicit history log. Content
@@ -158,15 +173,15 @@ export interface CouchDBSyncSettings {
 }
 
 /**
- * Hidden paths that are excluded BY DEFAULT (safe baseline). Kept as a named
- * constant so the one-time settings migration can re-union them into an existing
- * config that predates a given entry — e.g. a config that never had `.git/` or
- * `.obsidian/` in its blacklist would otherwise sync a whole git repo. Users can
- * still opt any of these back IN by removing the line (or whitelisting via
- * hiddenInclude); the migration only runs once per schema bump, so a deliberate
- * later removal is respected.
+ * Paths that are excluded BY DEFAULT (safe baseline), at any depth and whether
+ * hidden or not. Kept as a named constant so the one-time settings migration can
+ * re-union them into an existing config that predates a given entry — e.g. a config
+ * that never had `.git/` or `.obsidian/` in its blacklist would otherwise sync a
+ * whole git repo. Users can still opt any of these back IN by removing the line (or
+ * by naming a path under it in `syncInclude`); the migration only runs once per
+ * schema bump, so a deliberate later removal is respected.
  */
-export const DEFAULT_HIDDEN_EXCLUDE: string[] = [
+export const DEFAULT_EXCLUDE: string[] = [
 	".git/",
 	".trash/",
 	".DS_Store",
@@ -186,10 +201,10 @@ export const DEFAULT_HIDDEN_EXCLUDE: string[] = [
  * workspace layout and plugin state, which is exactly what the baseline exists
  * to prevent. The value is therefore injected by the caller.
  */
-export function defaultHiddenExclude(configDir: string): string[] {
+export function defaultExclude(configDir: string): string[] {
 	return [
 		`${configDir}/`,
-		...DEFAULT_HIDDEN_EXCLUDE,
+		...DEFAULT_EXCLUDE,
 		`${configDir}/workspace.json`,
 		`${configDir}/workspace-mobile.json`,
 		`${configDir}/cache`,
@@ -213,10 +228,11 @@ export const DEFAULT_SETTINGS: CouchDBSyncSettings = {
 	syncEnabled: true,
 	liveSync: true,
 	syncHidden: false,
-	// when hidden sync is ON, keep these volatile/risky hidden paths out
-	hiddenExclude: [...DEFAULT_HIDDEN_EXCLUDE],
-	// when hidden sync is OFF, sync nothing hidden by default
-	hiddenInclude: [],
+	// never synced, hidden or not. The vault's configuration folder is added on load
+	// (its name is only known from Vault#configDir — see defaultExclude).
+	syncExclude: [...DEFAULT_EXCLUDE],
+	// nothing is re-included by default
+	syncInclude: [],
 	keepHistory: 50,
 	showExcluded: false,
 	unsafeShutdown: false,

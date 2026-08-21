@@ -496,44 +496,47 @@ export class CouchDBSyncSettingTab extends PluginSettingTab {
 					row(
 						"Sync hidden files",
 						`Hidden files are things like ${cfg} (your settings & plugins) and .git. ` +
-							"Normal notes & attachments are always synced. (Our own plugin's data.json is never synced.)",
+							"Off means none of them sync; the two lists below apply either way. " +
+							"(Our own plugin's data.json is never synced.)",
 						(setting) =>
 							setting.addToggle((t) =>
 								t.setValue(s.syncHidden).onChange(async (v) => {
 									s.syncHidden = v;
 									await this.plugin.saveSettings();
-									this.update(); // swap between the exclude / include list
 								})
 							)
 					),
-					// ON: blacklist — everything hidden syncs except these
+					// The general blacklist. Always visible, because it always applies —
+					// to normal notes and attachments just as much as to hidden files.
 					row(
-						"…except these",
-						"One path per line. These hidden files/folders are NOT synced. Everything else hidden is.",
+						"Do not sync these",
+						"One path per line. These files and folders are never synced — on any device. " +
+							"A line ending in / matches that folder at any depth, so node_modules/ also " +
+							"covers Projects/app/node_modules/.",
 						(setting) =>
 							setting.addTextArea((t) => {
-								t.setValue(s.hiddenExclude.join("\n")).onChange(async (v) => {
-									s.hiddenExclude = v.split("\n").map((x) => x.trim()).filter((x) => x.length > 0);
+								t.setValue(s.syncExclude.join("\n")).onChange(async (v) => {
+									s.syncExclude = splitLines(v);
 									await this.plugin.saveSettings();
 								});
 								t.inputEl.rows = 8;
-							}),
-						{ visible: () => this.plugin.settings.syncHidden }
+							})
 					),
-					// OFF: whitelist — nothing hidden syncs except these
+					// The narrow opt-in. It beats BOTH the list above and the toggle, which
+					// is the only way to say "from this excluded area I want exactly one thing".
 					row(
-						"…but still sync these",
-						"One path per line. Hidden files are skipped — list any you DO want synced " +
-							`(e.g. ${cfg}/snippets/). Leave empty to skip all hidden files.`,
+						"Sync these anyway",
+						"One path per line, and these win: anything listed here is synced even when " +
+							`it is hidden or excluded above (e.g. ${cfg}/snippets/). Leave empty if you ` +
+							"do not need an exception.",
 						(setting) =>
 							setting.addTextArea((t) => {
-								t.setValue(s.hiddenInclude.join("\n")).onChange(async (v) => {
-									s.hiddenInclude = v.split("\n").map((x) => x.trim()).filter((x) => x.length > 0);
+								t.setValue(s.syncInclude.join("\n")).onChange(async (v) => {
+									s.syncInclude = splitLines(v);
 									await this.plugin.saveSettings();
 								});
 								t.inputEl.rows = 4;
-							}),
-						{ visible: () => !this.plugin.settings.syncHidden }
+							})
 					),
 				],
 			},
@@ -682,4 +685,12 @@ export class CouchDBSyncSettingTab extends PluginSettingTab {
 			},
 		];
 	}
+}
+
+/** One path per line, trimmed, blanks dropped — the shape both path lists persist in. */
+function splitLines(value: string): string[] {
+	return value
+		.split("\n")
+		.map((x) => x.trim())
+		.filter((x) => x.length > 0);
 }

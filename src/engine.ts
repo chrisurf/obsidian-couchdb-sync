@@ -31,8 +31,9 @@ import {
 	cyrb53,
 	isHidden,
 	isIdbClosingError,
+	isPathExcluded,
 	looksLikeText,
-	matchesIgnore,
+	needsHiddenScan,
 	pickConflictWinner,
 	sha256Hex,
 	shouldWalkHiddenDir,
@@ -100,16 +101,17 @@ export interface IndexReport {
 	notPushed?: string[]; // in the local cache, not on the server — "not pushed yet"
 }
 
-/** True for paths we never sync. Shared by the engine and the index report. */
-function isSkipped(path: string, app: App, settings: CouchDBSyncSettings): boolean {
+/**
+ * True for paths we never sync. Shared by the engine and the index report.
+ *
+ * Two hard rules first — an interrupted download's temp file and our own
+ * `data.json`, neither of which the user may opt back in — then the configurable
+ * ones (`isPathExcluded`: exclude wins unless explicitly re-included).
+ */
+export function isSkipped(path: string, app: App, settings: CouchDBSyncSettings): boolean {
 	if (path.endsWith(TMP_SUFFIX)) return true;
 	if (path === `${app.vault.configDir}/plugins/couchdb-sync/data.json`) return true;
-	if (isHidden(path)) {
-		return settings.syncHidden
-			? matchesIgnore(path, settings.hiddenExclude) // ON: skip blacklisted
-			: !matchesIgnore(path, settings.hiddenInclude); // OFF: skip unless whitelisted
-	}
-	return false; // normal files are always synced
+	return isPathExcluded(path, settings);
 }
 
 /**
@@ -188,7 +190,7 @@ export async function buildIndexReport(
 	const records = syncState ?? (await readSyncStateRecords(db));
 
 	const normal = app.vault.getFiles().map((f) => f.path);
-	const hidden = settings.syncHidden ? await listHidden(app, settings) : [];
+	const hidden = needsHiddenScan(settings) ? await listHidden(app, settings) : [];
 	const vaultPaths = [...normal, ...hidden].filter((p) => !isSkipped(p, app, settings));
 	const vaultSet = new Set(vaultPaths);
 
@@ -421,7 +423,7 @@ export class SyncEngine {
 	private beginLiveWatch(): void {
 		if (this.aborted || !this.settings.liveSync) return;
 		if (this.eventRefs.length === 0) this.attachVaultEvents();
-		if (this.settings.syncHidden && this.hiddenTimer === null) {
+		if (needsHiddenScan(this.settings) && this.hiddenTimer === null) {
 			this.hiddenTimer = window.setInterval(() => void this.scanHidden(), 30_000);
 		}
 		// Self-healing slow path in BOTH directions: the live feed and vault events can be
@@ -442,7 +444,7 @@ export class SyncEngine {
 		try {
 			await this.cleanupTempFiles();
 			await this.indexLocalFiles();
-			if (this.settings.syncHidden) await this.scanHidden();
+			if (needsHiddenScan(this.settings)) await this.scanHidden();
 			await this.retryPending();
 			// Download the files that live only in the database (the "remote only"
 			// state) — the download half of a two-way Force sync.
@@ -469,9 +471,18 @@ export class SyncEngine {
 
 	// --- hidden files (no vault events -> scanned by polling) ---------------
 
-	/** Index changed hidden files and propagate hidden deletions. Cheap stat checks. */
+	/**
+	 * Index changed hidden files and propagate hidden deletions. Cheap stat checks.
+	 *
+	 * Runs whenever anything hidden is in scope — the toggle being on, OR a hidden
+	 * path named in "Sync these anyway". Gating it on the toggle alone made the
+	 * include list inert in the one mode it exists for: hidden files reach the engine
+	 * only through this walk (Obsidian's vault events never fire for them), so with
+	 * the toggle off an included `.obsidian/snippets/` was never scanned and never
+	 * pushed.
+	 */
 	private async scanHidden(): Promise<void> {
-		if (!this.settings.syncHidden || this.aborted) return;
+		if (!needsHiddenScan(this.settings) || this.aborted) return;
 		const adapter = this.app.vault.adapter;
 		const paths = (await listHidden(this.app, this.settings, () => this.aborted)).filter(
 			(p) => !this.skip(p)
@@ -1171,7 +1182,7 @@ export class SyncEngine {
 		return !!rec && rec.mtime === file.stat.mtime && rec.size === file.stat.size;
 	}
 
-	/** Paths we never sync. Normal files are always synced; hidden files depend on the toggle. */
+	/** Paths we never sync — see {@link isSkipped}. */
 	private skip(path: string): boolean {
 		return isSkipped(path, this.app, this.settings);
 	}

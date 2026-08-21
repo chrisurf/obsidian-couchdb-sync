@@ -272,9 +272,9 @@ Available from Obsidian's command palette (`Ctrl/Cmd + P`).
 | Where credentials are kept | this device | What unlocks the encrypted password/passphrase in `data.json`: a key held on this device only, or a passphrase asked at every launch |
 | Conflict strategy | newest wins | Who wins when two devices edit the same note |
 | This device is the master | off | With *master wins*: this device's version always wins. Turn on for exactly one device |
-| Sync hidden files | off | Also sync `.obsidian` (your settings, themes, plugins), `.git`, etc. |
-| …except these | a safe default list | With hidden sync on: which hidden folders to leave out |
-| …but still sync these | _(empty)_ | With hidden sync off: which hidden folders to include anyway |
+| Sync hidden files | off | Also sync `.obsidian` (your settings, themes, plugins), `.git`, etc. The two lists below apply either way |
+| Do not sync these | a safe default list | One path per line, never synced — notes and attachments included. A line ending in `/` matches that folder at any depth, so `node_modules/` also covers `Projects/app/node_modules/` |
+| Sync these anyway | _(empty)_ | One path per line, and these win: synced even when hidden or excluded above (e.g. `.obsidian/snippets/`) |
 | Download from server | — | **Server wins here:** overwrite this device's files with the server's version and fetch anything missing. Uploads nothing; local-only files are kept; any overwritten edit is saved to history |
 | Upload to server | — | **This device wins on the server:** overwrite the server's copy of every file with this device's, and add local-only files. Server-only files are kept (not deleted). Affects every other device |
 | Wipe local cache | — | Deletes this device's copy. The server is not touched |
