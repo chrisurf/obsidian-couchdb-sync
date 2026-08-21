@@ -8,23 +8,153 @@ Every claim below was checked against the code at **0.40.0**, not taken from the
 roadmap text. Sizes are relative (XS/S/M/L) with a rough range; treat them as
 sequencing information, not as commitments.
 
-**One caveat before the order:** this is sorted by *effort*, as asked. Sorted by
-*value* the list would open with R1 — it is the only remaining item that can still
-destroy a user's git repository. It sits at position 3 because two things are even
-cheaper, not because it is less important. If you would rather ship value first, pull
-R1 to the front; it depends on nothing.
+**One caveat before the order:** everything from Batch 1 down is sorted by *effort*,
+cheapest first. Batch 0 is the exception and is placed by *decision* — these three lead
+regardless of what they cost, and are not traded against cheaper items that happen to
+fit in an afternoon. **R13 is next up**: it is the only open item with no workaround at
+all. R9 follows because it is the destructive action. R14 third because it is currently
+telling users the opposite of the truth. Each gets its own PR.
+
+---
+
+## Batch 0 — first, each on its own PR
+
+### 1. R13 — one exclude list that applies to every file · M (~4–6 h)
+
+**Files:** `src/engine.ts` (`isSkipped`), `src/types.ts` (the default lists),
+`src/settings.ts` (both list fields), `src/migrate.ts` (v7),
+`tests/hidden-scan.test.ts`, `tests/migrate.test.ts`.
+
+Today the exclude/include lists are only consulted inside the `isHidden(path)` branch
+of `isSkipped()`. A normal file falls straight through to `return false` — always
+synced. So `node_modules/`, which is already in the defaults, does nothing for
+`Projects/app/node_modules/`; it only ever matches a `node_modules` under a hidden
+folder. A vault with one Node project in it syncs tens of thousands of files and the
+user has no setting to stop it.
+
+Build it in this order:
+
+1. **Move the exclude check above `isHidden()`** in `isSkipped()`, so it applies to
+   every path. `matchesIgnore` needs no change — `node_modules/` already matches at any
+   depth via `path.includes("/" + p)`. This is the whole fix for the reported problem;
+   everything below is making it comprehensible.
+2. **Keep the include list as the override**, ahead of the exclude check. It is the
+   only way to say "from this excluded area I want exactly one thing" —
+   `.obsidian/snippets/` in one line, versus enumerating every other plugin folder in a
+   list that is never finished. Rule: **exclude wins unless explicitly re-included.**
+3. **Both fields visible at once**, with new labels. They currently swap on
+   `syncHidden` and are phrased as continuations of the toggle (*"…except these"*,
+   *"…but still sync these"*), which stops being true once the exclude list always
+   applies. *"Do not sync these"* and *"Sync these anyway"*, each saying plainly what
+   it does and which one wins.
+4. **Migration v7.** Existing entries keep working and now reach further. Nothing is
+   deleted — a newly excluded file stops being pushed, stays on every disk, and shows
+   in the tree as *excluded*; removing the line brings it back.
+
+**Watch out for:** the hidden behaviour must come out unchanged. With
+`syncHidden: false` and an empty include list, nothing hidden may sync — that is the
+existing contract and `tests/hidden-scan.test.ts` already pins the walk-level half of
+it.
+
+**Done when:** `isSkipped` is tested for a **normal** path (`node_modules/x.js`
+excluded by default, `Notes/note.md` synced, an include re-enabling an excluded normal
+path), the hidden cases still pass untouched, and a migration test covers a pre-v7
+config.
+
+**Risk:** medium. It changes which files are in scope for sync, which is the core
+classification every other path depends on — hence its own PR. The failure mode is
+"something the user wanted is no longer synced", visible in the tree as *excluded* and
+undone by deleting a line; nothing is removed from disk or from the server.
+
+---
+
+### 2. R9 — show the delta before "Reset server" destroys it · M (~4–6 h)
+
+**Files:** `src/main.ts` (`doServerReset`), `src/util.ts` (the comparison),
+`src/history.ts` (`ConfirmModal`), `src/settings.ts` (the confirmation copy), new
+`tests/reset-preflight.test.ts`.
+
+"Reset server" empties the remote database and re-uploads this device's files. Its
+dialog describes what the action does in general, and says nothing about what it will
+do *here* — so the harmless case (both sides already match, nothing is lost) and the
+expensive one (another device pushed files this device never had) are presented
+identically, and the user confirms blind.
+
+The work splits cleanly in three, which is also the order to build it:
+
+1. **The comparison, pure.** `(serverPaths, diskPaths) → { equal, serverOnly,
+   localOnly, serverCount, diskCount }` in `src/util.ts`. Testable with no Obsidian
+   and no database, and it is where the one subtle decision lives: compare against
+   **disk**, not against the local cache. The re-upload afterwards walks
+   `app.vault.getFiles()`, so disk is what survives; `IndexReport.serverOnly` is
+   computed against the cache and would answer a different question.
+2. **The pre-flight, in `doServerReset`.** After the existing credential and
+   passphrase checks, before `resetRemote()`. Take a *fresh* scan — `main.ts` throttles
+   `scanRemote()` to 15 s, which is correct for the panel and wrong for the one moment
+   the reading has to be right. No difference → today's dialog, one click, unchanged.
+3. **The delta dialog.** Counts side by side with a proportional bar, the server-only
+   paths listed by name (truncated with "…and N more"), local-only kept visually
+   separate because those are uploaded rather than lost, and **Delete anyway** /
+   **Cancel**. `ConfirmModal` currently takes a plain string `body`, so give it a
+   render hook rather than writing a second modal — two destructive dialogs that look
+   different is a worse outcome than either of them alone.
+
+**Watch out for:** an unreachable server. The scan can fail, and "I could not check"
+must not fall through to the silent path — an unknown delta is not an empty one. Route
+it to the delta dialog with its own wording.
+
+**Done when:** the pure comparison is tested over all four shapes; cancelling the
+delta dialog leaves the server untouched; and a two-device manual run (push a file
+from B only, then Reset on A) names that file in the dialog.
+
+**Risk:** medium, and concentrated in one place — this is a destructive path, so it
+wants its own PR and the manual two-device run before merging. The failure mode of the
+change itself is benign (an extra dialog where none was needed); the failure mode of
+getting the *comparison* wrong is not, which is why it is pure and tested first.
+
+---
+
+### 3. R14 — say what the server actually answered · S (~2–3 h)
+
+**Files:** `src/database.ts` (`testConnection`, `scanRemote`), `src/indexpanel.ts`
+(the server error wording), `src/engine.ts` (live-feed revival), `tests/database.test.ts`.
+
+Reproduced against a real server: CouchDB replies **403**
+`{"error":"forbidden","reason":"You are not allowed to access this db."}` — login fine,
+account not a member of the database. The plugin then says three wrong things: the
+connection test reports **success** (the JSON error body is read as database info
+without a status check, which is where the `(undefined docs)` comes from, and it sets
+`connectionVerified`), the panel reports **"server unreachable (network/transport)"**
+(403 is missing from the `401 → auth / 404 → notfound / else → network` mapping), and
+the retry loop never stands down (live feed plus the 15 s scan, several hundred
+identical console errors).
+
+- Check the status before treating a body as info; add the `403` branch to
+  `testConnection()` naming the actual cause, and report the real status code in the
+  catch-all.
+- Add `forbidden` to `RemoteScan.error` and give it wording that separates "answered,
+  but refused" from "did not answer".
+- Stop reviving the feed on a repeated 401/403 until something changes — settings
+  edited, credentials unlocked, manual Force sync. `hasCredentials()` is the precedent.
+
+**Done when:** the status mapping is tested end to end (401/403/404/network), and a
+403 body makes `testConnection()` return `ok: false` — the regression that otherwise
+passes silently.
+
+**Risk:** low, and confined to error paths. Do it near R8 Level 2, which extends the
+same error vocabulary for Cloudflare Access.
 
 ---
 
 ## Batch 1 — one sitting, one PR
 
-Three items, none of which touches sync behaviour. They are independent, so a single
-PR is honest here rather than three.
+Five items, none of which touches sync behaviour. They are independent, so a single
+PR is honest here rather than five.
 
-**Items 1 and 2 are done**; item 3 is still open. Both are marked ✅ below with what
-actually shipped, since it differed from the plan in one place.
+**Items 4 and 5 are done**; items 6–8 are still open. Both finished ones are marked ✅
+below with what actually shipped, since it differed from the plan in one place.
 
-### 1. ✅ R8 Level 1 — document the Cloudflare Tunnel · XS (~30 min)
+### 4. ✅ R8 Level 1 — document the Cloudflare Tunnel · XS (~30 min)
 
 **Files:** `README.md` only. No code.
 
@@ -35,14 +165,14 @@ Nothing in the plugin knows or cares.
 - Add a *Cloudflare Tunnel* entry to the README's **Getting a server** section,
   alongside the existing options.
 - State plainly what it does and does not give you: no open port, no public IP, no
-  manual certificate — but also no access control. Access control is Level 2 (item 8).
+  manual certificate — but also no access control. Access control is Level 2 (item 13).
 
 **Done when:** a reader can set up a tunnel from the README without leaving it.
 **Risk:** none. Nothing to break.
 
 ---
 
-### 2. ✅ R5 — rename `putLocalDoc` · XS (~20 min)
+### 5. ✅ R5 — rename `putLocalDoc` · XS (~20 min)
 
 **Files:** `src/database.ts:782`, plus 6 call sites (`src/engine.ts` ×4,
 `src/main.ts:768`).
@@ -74,40 +204,84 @@ renaming more code and reviewing the trap twice.
 
 ---
 
-### 3. R1 — make `.git/` unskippable · S (~1–2 h)
+### 6. R10 — stop the derived-key cache from growing forever · XS (~30 min)
 
-**Files:** `src/engine.ts:104` (`isSkipped`), `tests/hidden-scan.test.ts`.
+**Files:** `src/crypto.ts` (`deriveKey`, `keyCache`), `src/main.ts` (`teardown`),
+`tests/crypto.test.ts`.
 
-Today `isSkipped()` hard-protects exactly two things — the streaming temp suffix and
-the plugin's own `data.json`. Everything else, `.git/` included, rests on the
-user-editable `hiddenExclude` list. Empty that list and the plugin replicates a git
-repository.
+`deriveKey` caches under `base64(salt) + "|" + passphrase` and never evicts. Every
+`encryptString` / `encryptBytes` call draws a *fresh random salt*, so every chunk
+written inserts an entry that can never be looked up again — a 600 MB upload leaves
+~600 dead `CryptoKey`s, a full vault upload thousands. `clearKeyCache()` was written
+for this and is never called; `teardown()` clears only the credential cache.
 
-That is not noise, it is destruction: objects, packs and refs replicate independently
-and with delay, so a half-synced `.git/` on a second device is a corrupt repository.
+- Skip the cache write on the encrypt path (the entry is provably unreachable).
+- Keep it on the decrypt path, where a repeated salt is real — a chunk shared across
+  files, or a re-read after the hydrated cache was rebuilt.
+- Cap what remains with a small LRU, and call `clearKeyCache()` in `teardown()`
+  alongside `clearSecretKeyCache()`.
 
-**Change:** add to the unconditional branch, above the `isHidden()` check:
+**Done when:** a test asserts N encryptions leave the cache size unchanged and that
+decrypting the same payload twice derives once.
 
-- any path at or under `.git/`
-- the plugin's own folder `<configDir>/plugins/couchdb-sync/` — today only its
-  `data.json` is protected, so a sibling file (a lock file, a future cache) is fair
-  game
+**Risk:** none — the net effect on the sync path is less work. Worth stating plainly
+in the commit that this is a memory fix, not a confidentiality one: the cache only
+ever held keys the running session was already entitled to, and someone skimming the
+diff will otherwise assume the opposite.
 
-Keep both in `DEFAULT_HIDDEN_EXCLUDE` so the settings UI still lists them. The hard
-rule is the backstop; the list stays the display.
+---
 
-**Watch out for:** `shouldWalkHiddenDir()` in `src/util.ts` prunes the hidden-file
-walk separately. Skipping a path at classification time does not stop the walker
-descending into it, so a vault with a large `.git/` still pays for the walk. Prune
-there too, or the fix is correct but slow.
+### 7. R11 — warn on an `http://` server URL · S (~1 h)
 
-**Done when:** a test sets `hiddenExclude: []` **and** `syncHidden: true` — the
-maximally permissive configuration — and asserts `.git/objects/ab/cdef` is still
-skipped. Add a second for the plugin folder.
+**Files:** `src/util.ts` (the predicate), `src/settings.ts` (the connection section
+and the Test result), `tests/util.test.ts`.
 
-**Risk:** low. The change only *adds* skips, so the failure mode is "a file the user
-wanted is not synced", not data loss — and both paths are ones nobody should be
-syncing.
+Nothing checks the scheme. The field's own description says https is required; the
+code accepts `http://` and syncs, sending the CouchDB password in the clear in the
+`Authorization` header on every request. Nothing surfaces, so nothing gets noticed.
+
+A **warning, not a block** — and never for loopback, because `http://127.0.0.1:5984`
+is the Docker quickstart the README hands people in Step 1 and it has to keep working.
+Someone on a trusted LAN or behind a TLS-terminating tunnel may also mean it.
+
+**Watch out for:** doing this as a regex. Put it through `URL` and check the parsed
+host, or `https://evil.example.com/?x=http://` and similar shapes will decide it for
+you. An unparseable URL warns.
+
+**Done when:** the predicate is tested over https / http+loopback / http+remote /
+unparseable, and the warning appears inline in the connection section rather than only
+in the Test result — the point is to catch it while it is being typed.
+
+**Risk:** none. Advisory only; nothing changes about what connects.
+
+---
+
+### 8. R12 — per-folder file count in the status tree · S (~1–2 h)
+
+**Files:** `src/indexpanel.ts` (`renderTree`), `styles.css`, `tests/tree-count.test.ts`.
+
+A badge on each folder row showing how many files sit in its whole subtree,
+right-aligned just left of the `⋯` button. The row is already a flex line with the
+name at `flex: 1`, so inserting the span between the name and `iconBtn(...)` puts it
+exactly there; the pill styling already exists as `.couchdb-sync-section-count`.
+`renderTree` is shared, so all three store trees get it at once.
+
+Two things decide whether this looks finished or sloppy:
+
+- **File rows need an equal-width empty slot.** They are flex too, so their `⋯` is
+  flush right today. A badge on folder rows only pushes the folder's button left and
+  the `⋯` column stops lining up.
+- **Fold the count into the existing state walk.** `folderState()` already walks each
+  folder's whole subtree, once per folder — a file at depth *d* is visited *d* times.
+  Do not add a second walk. One post-order pass annotating each node with
+  `{ worst, count }` visits every file once, so this ships as a net speed-up rather
+  than a cost.
+
+**Done when:** the annotation pass is pure and tested without a DOM (nested sums, an
+empty folder at 0, root equal to the section total), and the `⋯` column is straight in
+a mixed folder/file tree.
+
+**Risk:** none. Display only; nothing it computes feeds a sync decision.
 
 ---
 
@@ -118,7 +292,7 @@ argument for doing them before, not after. The harness exists already: `reconcil
 `force-sync` and `remote-delete-propagation` all construct an engine against the
 in-memory adapter.
 
-### 4. R7 — echo guard · S (~2–3 h)
+### 9. R7 — echo guard · S (~2–3 h)
 
 **Files:** `src/engine.ts` — `suppress`, `handleLocalUpsert()`, `isUnchanged()`. New
 `tests/echo-guard.test.ts`.
@@ -137,7 +311,7 @@ Case 2 is the one that would silently lose a user's keystrokes if the guard were
 
 ---
 
-### 5. R6 — heal loop · M (~3–5 h)
+### 10. R6 — heal loop · M (~3–5 h)
 
 **Files:** `src/engine.ts` — `healAttempts`, `HEAL_MAX_ATTEMPTS` (= 3), `stuck`. New
 `tests/heal-loop.test.ts`.
@@ -159,7 +333,7 @@ the reconcile sweep and handle reopening. They do not touch this loop.
 
 ## Batch 3 — the two behavioural fixes
 
-### 6. R3 option 1 — refuse oversized files on mobile · M (~4–6 h)
+### 11. R3 option 1 — refuse oversized files on mobile · M (~4–6 h)
 
 **Files:** `src/engine.ts:1488` (the `desktopFs` gate), `writeAssembled()` at 1924;
 reporting in `src/indexpanel.ts`.
@@ -185,7 +359,7 @@ reported rather than assembled.
 
 ---
 
-### 7. R2 — sentinel document for passphrase mismatch · M–L (~1–2 days)
+### 12. R2 — sentinel document for passphrase mismatch · M–L (~1–2 days)
 
 **Files:** `src/engine.ts` (start path), `src/database.ts`, `src/main.ts` (`doRestart`
 is the precedent), settings/panel messaging.
@@ -222,7 +396,7 @@ that most wants its own PR and a manual two-device run before merging.
 
 ## Batch 4 — the big ones
 
-### 8. R8 Level 2 — Cloudflare Access · M–L (~2–3 days incl. verification)
+### 13. R8 Level 2 — Cloudflare Access · M–L (~2–3 days incl. verification)
 
 **Files:** `src/types.ts`, `src/database.ts` (`obsidianFetch`, `connectRemote`,
 `scanRemote`, `RemoteScan`), `src/settings.ts`, `src/main.ts`
@@ -284,7 +458,7 @@ without blocking them.
 
 ---
 
-### 9. R4 — tombstone sweep · L, design first
+### 14. R4 — tombstone sweep · L, design first
 
 **Files:** `src/engine.ts` — `handleLocalDelete()` writes `deleted: true` with
 `_deleted: false`.
@@ -312,16 +486,26 @@ this one to slip a release; that is the right call.
 
 | # | Item | Size | Risk | Blocks / blocked by |
 |---|---|---|---|---|
-| 1 | ✅ R8-L1 — tunnel docs | XS | none | — |
-| 2 | ✅ R5 — split `putLocalDoc` | XS | none | did before R2, R4 as planned |
-| 3 | R1 — hard-skip `.git/` | S | low | — |
-| 4 | R7 — echo guard test | S | none | — |
-| 5 | R6 — heal loop test | M | none | — |
-| 6 | R3-1 — mobile size ceiling | M | low | — |
-| 7 | R2 — passphrase sentinel | M–L | **startup path** | — |
-| 8 | R8-L2 — Cloudflare Access | M–L | medium | parallelisable |
-| 9 | R4 — tombstone sweep | L | **distributed correctness** | design note first |
+| 1 | R13 — general exclude list | M | **sync scope** | **next up**; no workaround exists |
+| 2 | R9 — reset pre-flight delta | M | **destructive path** | by decision, not by effort |
+| 3 | R14 — report 403 honestly | S | low | do near item 13 (same vocabulary) |
+| 4 | ✅ R8-L1 — tunnel docs | XS | none | — |
+| 5 | ✅ R5 — split `putLocalDoc` | XS | none | did before R2, R4 as planned |
+| 6 | R10 — bound the key cache | XS | none | — |
+| 7 | R11 — warn on `http://` | S | none | — |
+| 8 | R12 — per-folder file count | S | none | — |
+| 9 | R7 — echo guard test | S | none | — |
+| 10 | R6 — heal loop test | M | none | — |
+| 11 | R3-1 — mobile size ceiling | M | low | — |
+| 12 | R2 — passphrase sentinel | M–L | **startup path** | — |
+| 13 | R8-L2 — Cloudflare Access | M–L | medium | parallelisable |
+| 14 | R4 — tombstone sweep | L | **distributed correctness** | design note first |
 
-Items 1–3 are a single afternoon and a single PR. Items 4–5 are pure test work and can
-be picked up by anyone. Items 7 and 9 are the two that deserve their own PR, their own
-review and a manual run before merging.
+Items 1–3 lead, each on its own PR. Items 6–8 are a single afternoon and a single PR.
+Items 9–10 are pure test work and can be picked up by anyone. Items 1, 2, 12 and 14 are
+the four that deserve their own review and a manual run before merging.
+
+**R1 is gone, not forgotten.** It asked for `.git/` to be enforced in code so no
+setting could opt back in. Declined: the exclusion belongs in the configuration where
+the user can see and change it, and it is already there and already pruned at the
+walk level. See *Accepted, no action* in the roadmap.
