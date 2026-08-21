@@ -922,7 +922,9 @@ export class SyncEngine {
 		} else {
 			console.debug(summary);
 		}
-		if (this.settings.syncHidden) {
+		// Same gate as scanHidden: an included hidden path must be uploaded by a forced
+		// pass too, or "Upload to server" would quietly leave it behind.
+		if (needsHiddenScan(this.settings)) {
 			const adapter = this.app.vault.adapter;
 			const paths = (await listHidden(this.app, this.settings, () => this.aborted)).filter(
 				(p) => !this.skip(p)
