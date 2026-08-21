@@ -279,6 +279,49 @@ export function needsHiddenScan(rules: SkipRules): boolean {
 	return rules.syncHidden || rules.syncInclude.some((p) => !!p && isHidden(p));
 }
 
+/**
+ * What separates the server's contents from this device's disk. Produced by
+ * {@link comparePaths} and shown before "Reset server" empties the remote database.
+ */
+export interface PathDelta {
+	/** the two sides hold exactly the same paths — the reset destroys nothing */
+	equal: boolean;
+	/** on the server, not on this disk — the set the reset actually destroys */
+	serverOnly: string[];
+	/** on this disk, not on the server — uploaded again afterwards, so not a loss */
+	localOnly: string[];
+	serverCount: number;
+	diskCount: number;
+}
+
+/**
+ * Compare the server's paths with this device's, for the pre-flight in front of
+ * "Reset server". Pure, so the one decision that costs data if it is wrong can be
+ * tested without a database or an Obsidian app.
+ *
+ * The disk side is deliberately the DISK and not the local cache: the re-upload
+ * that follows a reset walks `Vault#getFiles()`, so what survives is what is on
+ * disk. `IndexReport.serverOnly` is computed against the cache and answers a
+ * different question.
+ *
+ * Duplicates on either side are collapsed, and the counts report distinct paths, so
+ * the two figures shown side by side are comparable.
+ */
+export function comparePaths(serverPaths: string[], diskPaths: string[]): PathDelta {
+	const server = new Set(serverPaths);
+	const disk = new Set(diskPaths);
+	const sort = (a: string[]) => a.sort((x, y) => x.localeCompare(y));
+	const serverOnly = sort([...server].filter((p) => !disk.has(p)));
+	const localOnly = sort([...disk].filter((p) => !server.has(p)));
+	return {
+		equal: serverOnly.length === 0 && localOnly.length === 0,
+		serverOnly,
+		localOnly,
+		serverCount: server.size,
+		diskCount: disk.size,
+	};
+}
+
 /** One block of a line-by-line diff: unchanged context, or a changed region. */
 export type DiffHunk =
 	| { type: "equal"; lines: string[] }

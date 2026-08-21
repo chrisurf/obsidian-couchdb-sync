@@ -11,15 +11,16 @@ sequencing information, not as commitments.
 **One caveat before the order:** everything from Batch 1 down is sorted by *effort*,
 cheapest first. Batch 0 is the exception and is placed by *decision* — these three lead
 regardless of what they cost, and are not traded against cheaper items that happen to
-fit in an afternoon. **R13 is next up**: it is the only open item with no workaround at
-all. R9 follows because it is the destructive action. R14 third because it is currently
-telling users the opposite of the truth. Each gets its own PR.
+fit in an afternoon. R13 led because it was the only open item with no workaround at
+all; R9 followed because it is the destructive action. Both are now done. **R14 is next
+up**, because it is currently telling users the opposite of the truth. Each gets its
+own PR.
 
 ---
 
 ## Batch 0 — first, each on its own PR
 
-### 1. R13 — one exclude list that applies to every file · M (~4–6 h)
+### 1. ✅ R13 — one exclude list that applies to every file · M (~4–6 h)
 
 **Files:** `src/engine.ts` (`isSkipped`), `src/types.ts` (the default lists),
 `src/settings.ts` (both list fields), `src/migrate.ts` (v7),
@@ -68,7 +69,7 @@ undone by deleting a line; nothing is removed from disk or from the server.
 
 ---
 
-### 2. R9 — show the delta before "Reset server" destroys it · M (~4–6 h)
+### 2. ✅ R9 — show the delta before "Reset server" destroys it · M (~4–6 h)
 
 **Files:** `src/main.ts` (`doServerReset`), `src/util.ts` (the comparison),
 `src/history.ts` (`ConfirmModal`), `src/settings.ts` (the confirmation copy), new
@@ -486,9 +487,9 @@ this one to slip a release; that is the right call.
 
 | # | Item | Size | Risk | Blocks / blocked by |
 |---|---|---|---|---|
-| 1 | R13 — general exclude list | M | **sync scope** | **next up**; no workaround exists |
-| 2 | R9 — reset pre-flight delta | M | **destructive path** | by decision, not by effort |
-| 3 | R14 — report 403 honestly | S | low | do near item 13 (same vocabulary) |
+| 1 | ✅ R13 — general exclude list | M | **sync scope** | done; migration v7 |
+| 2 | ✅ R9 — reset pre-flight delta | M | **destructive path** | done; two-device run still outstanding |
+| 3 | R14 — report 403 honestly | S | low | **next up**; do near item 13 (same vocabulary) |
 | 4 | ✅ R8-L1 — tunnel docs | XS | none | — |
 | 5 | ✅ R5 — split `putLocalDoc` | XS | none | did before R2, R4 as planned |
 | 6 | R10 — bound the key cache | XS | none | — |
@@ -501,7 +502,7 @@ this one to slip a release; that is the right call.
 | 13 | R8-L2 — Cloudflare Access | M–L | medium | parallelisable |
 | 14 | R4 — tombstone sweep | L | **distributed correctness** | design note first |
 
-Items 1–3 lead, each on its own PR. Items 6–8 are a single afternoon and a single PR.
+Items 1 and 2 are done, each on its own commit; item 3 leads what is left. Items 6–8 are a single afternoon and a single PR.
 Items 9–10 are pure test work and can be picked up by anyone. Items 1, 2, 12 and 14 are
 the four that deserve their own review and a manual run before merging.
 

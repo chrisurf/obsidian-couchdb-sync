@@ -1,9 +1,11 @@
 import { App, Notice, PluginSettingTab, Setting, type SettingDefinitionItem, type SettingDefinitionRender } from "obsidian";
 import type CouchDBSyncPlugin from "./main";
+import type { ResetPreflight } from "./main";
 import { SyncDatabase } from "./database";
 import { selfTest } from "./crypto";
 import { IndexPanel } from "./indexpanel";
 import { confirm } from "./history";
+import type { PathDelta } from "./util";
 
 /**
  * The plugin's settings tab: the sync status panel at the top, then the settings
@@ -67,6 +69,59 @@ export class CouchDBSyncSettingTab extends PluginSettingTab {
 					b.setIcon(shown ? "eye-off" : "eye").setTooltip(shown ? "Hide" : "Show");
 				})
 		);
+	}
+
+	/**
+	 * The destructive confirmation itself — unchanged from before the pre-flight, and
+	 * still the last thing between the user and an empty server.
+	 */
+	private confirmServerReset(): void {
+		confirm(this.app, {
+			title: "Delete everything on the server?",
+			body:
+				"The database on the server is deleted and rebuilt from this device: " +
+				`${this.plugin.settings.dbName} on ${this.plugin.settings.serverUrl}.\n\n` +
+				"Gone for good: every file version in the history, and anything that " +
+				"exists ONLY on the server (files no longer on this device are not " +
+				"restored). Your notes on this device are not touched.\n\n" +
+				"Every other device still holds a copy of the old database and will " +
+				"push it back when it syncs. On each of them: switch sync off now, " +
+				"and run “Wipe local cache” before switching it on again.",
+			cta: "Delete and re-upload",
+			danger: true,
+			onConfirm: async () => {
+				new Notice("Emptying the server and re-uploading…");
+				await this.plugin.resetServerFromLocal();
+				this.update();
+			},
+		});
+	}
+
+	/**
+	 * The extra dialog, shown ahead of the destructive one whenever the two sides
+	 * differ — or whenever the difference could not be measured at all.
+	 *
+	 * This is the only action that destroys data no other action can reach, and it was
+	 * the one where the user was given the least information: the case that costs data
+	 * (another device pushed files this one never had) looked exactly like the harmless
+	 * one. Confirming here only gets you to the confirmation.
+	 */
+	private confirmResetDelta(pre: ResetPreflight): void {
+		confirm(this.app, {
+			title: pre.checked
+				? "The server holds files this device does not"
+				: "Could not check what the reset would delete",
+			body: pre.checked
+				? "Everything below is deleted from the server. Only the files on this device are uploaded again."
+				: `The plugin could not read the server, so it cannot say what would be lost — ${pre.reason}. ` +
+					"That is not the same as “nothing”: another device may have pushed files this one has " +
+					"never seen. Cancel and try again once that is resolved, or continue deliberately.",
+			detail: pre.checked ? (el) => renderResetDelta(el, pre) : undefined,
+			cta: "Delete anyway",
+			danger: true,
+			focusCancel: true,
+			onConfirm: () => this.confirmServerReset(),
+		});
 	}
 
 	getSettingDefinitions(): SettingDefinitionItem[] {
@@ -608,26 +663,31 @@ export class CouchDBSyncSettingTab extends PluginSettingTab {
 								b
 									.setDestructive()
 									.setButtonText("Reset server")
-									.onClick(() => {
-										confirm(this.app, {
-											title: "Delete everything on the server?",
-											body:
-												"The database on the server is deleted and rebuilt from this device: " +
-												`${this.plugin.settings.dbName} on ${this.plugin.settings.serverUrl}.\n\n` +
-												"Gone for good: every file version in the history, and anything that " +
-												"exists ONLY on the server (files no longer on this device are not " +
-												"restored). Your notes on this device are not touched.\n\n" +
-												"Every other device still holds a copy of the old database and will " +
-												"push it back when it syncs. On each of them: switch sync off now, " +
-												"and run “Wipe local cache” before switching it on again.",
-											cta: "Delete and re-upload",
-											danger: true,
-											onConfirm: async () => {
-												new Notice("Emptying the server and re-uploading…");
-												await this.plugin.resetServerFromLocal();
-												this.update();
-											},
-										});
+									.onClick(async () => {
+										// Measure the damage BEFORE asking. The scan is a network
+										// round-trip, so the button says what it is doing meanwhile.
+										b.setButtonText("Checking the server…").setDisabled(true);
+										let pre: ResetPreflight;
+										try {
+											pre = await this.plugin.previewServerReset();
+										} catch (e) {
+											// A check that fails must reach the "could not check"
+											// dialog, never disappear and leave the button dead.
+											pre = {
+												checked: false,
+												reason: e instanceof Error ? e.message : String(e),
+											};
+										} finally {
+											b.setButtonText("Reset server").setDisabled(false);
+										}
+										// Nothing to lose → today's dialog, one click, unchanged. A
+										// guard that fires every time gets clicked away every time,
+										// including the time it mattered.
+										if (pre.checked && pre.delta.equal && pre.unreadable === 0) {
+											this.confirmServerReset();
+											return;
+										}
+										this.confirmResetDelta(pre);
 									})
 							)
 					),
@@ -685,6 +745,63 @@ export class CouchDBSyncSettingTab extends PluginSettingTab {
 			},
 		];
 	}
+}
+
+/** How many paths a delta list names before it collapses into "…and N more". */
+const DELTA_LIST_LIMIT = 12;
+
+/**
+ * The "Reset server" delta: how big each side is, and — the part that matters —
+ * which files exist only on the server, because those are the ones the reset
+ * destroys.
+ *
+ * The two sets are kept visually apart on purpose. Both count as a difference; only
+ * one of them is damage. Files that exist only on this device are uploaded again a
+ * moment later, and presenting them next to a real loss would train the user to read
+ * past the whole dialog.
+ */
+function renderResetDelta(el: HTMLElement, pre: { delta: PathDelta; unreadable: number }): void {
+	const { delta } = pre;
+	el.addClass("couchdb-sync-reset-delta");
+
+	// Counts side by side with a proportional bar, so the size of the gap is legible
+	// without reading the numbers.
+	const scale = Math.max(delta.serverCount, delta.diskCount, 1);
+	const bar = (label: string, count: number, cls: string) => {
+		const rowEl = el.createDiv({ cls: "couchdb-sync-delta-row" });
+		rowEl.createSpan({ text: label, cls: "couchdb-sync-delta-label" });
+		const track = rowEl.createDiv({ cls: "couchdb-sync-delta-track" });
+		const fill = track.createDiv({ cls: `couchdb-sync-delta-fill ${cls}` });
+		// The one genuinely dynamic value here; everything else is in styles.css.
+		fill.setCssStyles({ width: `${Math.round((count / scale) * 100)}%` });
+		rowEl.createSpan({ text: `${count} files`, cls: "couchdb-sync-delta-count" });
+	};
+	bar("Server", delta.serverCount, "is-server");
+	bar("This device", delta.diskCount, "is-disk");
+
+	const list = (title: string, paths: string[], cls: string) => {
+		if (paths.length === 0) return;
+		const box = el.createDiv({ cls: `couchdb-sync-delta-list ${cls}` });
+		box.createDiv({ text: `${title} (${paths.length})`, cls: "couchdb-sync-delta-list-title" });
+		const ul = box.createEl("ul");
+		for (const p of paths.slice(0, DELTA_LIST_LIMIT)) ul.createEl("li", { text: p });
+		if (paths.length > DELTA_LIST_LIMIT) {
+			ul.createEl("li", {
+				text: `…and ${paths.length - DELTA_LIST_LIMIT} more`,
+				cls: "couchdb-sync-delta-more",
+			});
+		}
+	};
+	list("Only on the server — deleted, and not restored", delta.serverOnly, "is-loss");
+	if (pre.unreadable > 0) {
+		el.createDiv({
+			cls: "couchdb-sync-delta-warn",
+			text:
+				`${pre.unreadable} more file(s) on the server could not be decrypted, so they are not ` +
+				"listed above. They are deleted too.",
+		});
+	}
+	list("Only on this device — uploaded again, so not lost", delta.localOnly, "is-safe");
 }
 
 /** One path per line, trimmed, blanks dropped — the shape both path lists persist in. */

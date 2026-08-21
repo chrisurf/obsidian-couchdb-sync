@@ -24,7 +24,7 @@ Listed in **priority order**. The R-numbers are stable identifiers so a referenc
 a commit or an issue keeps pointing at the same thing — they are not the sequence to
 work in.
 
-### R13 🔴 — Normal files cannot be excluded from sync at all
+### R13 ✅ — Normal files cannot be excluded from sync at all
 
 **Where:** `src/engine.ts` — `isSkipped()`; `src/types.ts` — `DEFAULT_HIDDEN_EXCLUDE`
 / `defaultHiddenExclude()`; `src/settings.ts` (the two list fields); `src/migrate.ts`
@@ -97,9 +97,31 @@ any depth (`path.includes("/" + p)`), so `node_modules/` catches
 - A migration test that a pre-v7 config keeps its own entries and gains the wider
   reach.
 
+**Done:** the decision moved into one pure function, `isPathExcluded` in `src/util.ts`
+— include beats exclude beats the hidden toggle — and `isSkipped` now delegates to it
+after its two hard rules (temp files, our own `data.json`). The lists were renamed with
+it: `syncExclude` / `syncInclude`, both visible at all times as *"Do not sync these"* /
+*"Sync these anyway"*. Migration v7 carries the entries over verbatim and runs **before**
+v1, so the whole migration stays idempotent.
+
+Two things were found while building it that the item did not foresee:
+
+- **The include list was inert.** Hidden files reach the engine only through
+  `scanHidden`, which was gated on `syncHidden` — so with the toggle off, an included
+  `.obsidian/snippets/` was never walked and never pushed, in the one mode the
+  whitelist exists for. The gate is now `needsHiddenScan()` (toggle on, or a *hidden*
+  path in the include list), and `shouldWalkHiddenDir` no longer prunes a folder that
+  holds an included path.
+- **An include now beats an exclude with hidden sync ON as well.** Previously the
+  include list was ignored entirely in that mode. That is the generalization this item
+  asked for, but it is a behaviour change for a config that lists the same path twice.
+
+Covered by `tests/skip-rules.test.ts` (renamed from `hidden-scan.test.ts`, which no
+longer described what it tests) and five new cases in `tests/migrate.test.ts`.
+
 ---
 
-### R9 🔴 — "Reset server" deletes without saying what will be lost
+### R9 ✅ — "Reset server" deletes without saying what will be lost
 
 **Where:** `src/main.ts` — `doServerReset()`; the confirmation in `src/settings.ts`
 ("Reset the server from this device"); `ConfirmModal` in `src/history.ts`
@@ -163,6 +185,26 @@ it rather than a second modal class — the two destructive dialogs should keep 
   never the silent path.
 - Manual two-device run: push a file from device B only, then run Reset on device A.
   That file must appear **by name** in the dialog.
+
+**Done:** `comparePaths()` in `src/util.ts` (pure, ten tests in
+`tests/reset-preflight.test.ts`), `previewServerReset()` in `src/main.ts` for the
+fresh scan, and the two-stage dialog in `src/settings.ts`. `ConfirmModal` gained a
+`detail` render hook and a `focusCancel` option instead of a second modal class, so
+the two destructive dialogs keep one look and a stray Enter cannot empty a server.
+
+`ResetPreflight` is a union, not a struct with optional fields, so an unmeasured delta
+cannot be read as an empty one — the failure the item warns about is unrepresentable
+rather than merely avoided.
+
+One case the item did not name: **partially unreadable server contents.** Docs that
+fail to decrypt are missing from `serverPaths`, so the delta *understates* the loss.
+The pre-flight carries that count and the dialog says it plainly; if *every* doc fails
+(the documented passphrase-change flow) it reports "could not check" instead of
+"nothing to lose".
+
+**Still outstanding:** the manual two-device run. Everything above is unit-tested and
+was checked against a rendered dialog, but no real second device has pushed a file
+into a real server for this yet.
 
 ---
 
@@ -597,7 +639,7 @@ Carried over so nobody re-opens them without new information.
 | **History id leaks an 8-char hash prefix** | The tail is a hash of the child-id list, not a chunk id, so it reveals version-content equality and timestamp correlation — both already disclosed in the README as residuals. Changing the id format breaks stored data. |
 | **Change detection compares mtime + size only** | A content hash on every stat call would defeat the fast path. The failure mode — an in-place edit that preserves both size and mtime — is rare, and the reconcile sweep catches the common variants. |
 | **Migration re-unions the hidden-exclude defaults** | It runs once (gated on `priorVersion < 1`), so a config that predates an entry gets it, and a deliberate later removal is respected. Both halves are intended. |
-| **`.git/` is excluded by configuration, not by a hard rule** | It ships in `DEFAULT_HIDDEN_EXCLUDE`, it is visible in the *"…except these"* field, and it can be removed. That is the design: nothing is protected from the user, everything is configured in one place the user can read. A 0.32.0 review asked for it to be enforced in code so no setting could opt back in — **declined**, because it would take away a choice that is legitimately the user's. The walk is already pruned at the folder level (`shouldWalkHiddenDir`), so an excluded `.git/` also costs nothing to skip. No warning either: the settings already show what is excluded. |
+| **`.git/` is excluded by configuration, not by a hard rule** | It ships in `DEFAULT_EXCLUDE`, it is visible in the *"Do not sync these"* field, and it can be removed. That is the design: nothing is protected from the user, everything is configured in one place the user can read. A 0.32.0 review asked for it to be enforced in code so no setting could opt back in — **declined**, because it would take away a choice that is legitimately the user's. The walk is already pruned at the folder level (`shouldWalkHiddenDir`), so an excluded `.git/` also costs nothing to skip. No warning either: the settings already show what is excluded. |
 | **Chunk dedup reveals repetition structure** | Identical plaintext chunks share an id, so the server sees which pieces repeat. Inherent to content-addressed dedup, and disclosed in the README. |
 | **Initial index is serial** | One file per event-loop tick keeps the UI responsive. The two things that made it pathological — walking `.git/`, and re-serializing the whole state map per file — are both fixed (hidden-walk pruning and 64-way state sharding). |
 
@@ -610,12 +652,11 @@ Carried over so nobody re-opens them without new information.
 | **Next** | R13, R9, R14, R10, R11, R12, R2, R3 (option 1), R6, R7 |
 | **The one after** | R4, R8 (Level 2), R3 (option 2 — chunk-wise append) |
 
-**R13 is next, before anything else.** It is the only open item with *no workaround*:
-a vault holding a Node project cannot be made to stop syncing it, by any setting, and
-every file it drags in is hashed, encrypted, replicated and re-walked on every index
-refresh. R9 follows because it is the one place the plugin destroys data *on the
-user's own instruction* while withholding what that instruction will cost. R14 comes
-third for the opposite reason — it is small, it is reproduced, and it currently tells
+**R13 and R9 are done** — the two that led this batch, each on its own commit. R13
+because it was the only open item with *no workaround* (a vault holding a Node project
+could not be made to stop syncing it, by any setting), and R9 because it is the one
+place the plugin destroys data *on the user's own instruction* while withholding what
+that instruction will cost. **R14 is next** for the opposite reason — it is small, it is reproduced, and it currently tells
 the user the opposite of the truth twice in a row. R10, R11 and R12 ride along because
 each is an afternoon's work and none touches sync behaviour. R6 and R7 belong in the
 same release because they cover the paths R2 and R3 touch. R8 Level 2 is additive and

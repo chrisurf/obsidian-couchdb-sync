@@ -50,6 +50,16 @@ CouchDB Sync is now in **beta**: it works well and is genuinely useful for every
 
 **The best part: syncing is now super simple.** Flip it on once and it just runs — every change uploads and downloads automatically in the background, across all your devices. Encryption is always on and live sync is always on, so there are no modes to choose and no buttons to babysit. Once your server and passphrase check out, the setup even tidies itself away so the settings stay clean.
 
+## 🚫 One list that keeps things out — for real this time
+
+**Settings → Sync** now has two lists that always apply, to notes and attachments just as much as to hidden files: **Do not sync these** and **Sync these anyway**. The rule is the one you already know from \`.gitignore\`: *excluded, unless a line puts it back in.*
+
+Until now those lists were only ever consulted for hidden files, which quietly made their own defaults useless — the \`node_modules/\` line matched nothing under \`Projects/app/\`, and a vault with one Node project in it had no setting anywhere that could stop it syncing tens of thousands of files. Your existing entries carry over unchanged; they simply reach further now. Nothing is deleted: a newly excluded file stops syncing, stays on every disk, and shows in the status tree as *excluded* — delete the line and it comes straight back.
+
+## 🛑 "Reset server" now tells you what it will delete
+
+Emptying the server is the one action that destroys data nothing else can reach, and it used to describe the danger in general terms without saying whether it applied to *you*. It now checks the server first. If both sides already match it asks once, exactly as before. If the server holds files this device does not — pushed by another device, say — it names them before anything is deleted, and separates them from the files that are merely local and get uploaded again. If it cannot reach the server, it says so rather than pretending there is nothing to lose.
+
 ## 🔌 First time here? Connect a server
 
 Your notes sync through a **CouchDB** server that you choose — rented, or running on a machine of your own. Open **Settings → CouchDB Sync**, enter the server URL, database name, username and password, and press **Test connection**.

@@ -27,7 +27,14 @@ import { CouchDBSyncSettingTab } from "./settings";
 import { SyncStatusView, VIEW_TYPE_SYNC_STATUS } from "./view";
 import { WhatsNewModal } from "./whatsnewmodal";
 import { shouldShowWhatsNew } from "./whatsnew";
-import { generateDeviceId, sha256Hex, textToBytes, toError } from "./util";
+import {
+	comparePaths,
+	generateDeviceId,
+	type PathDelta,
+	sha256Hex,
+	textToBytes,
+	toError,
+} from "./util";
 
 /** _local doc id under which we remember which remote this cache belongs to. */
 const ORIGIN_FP_DOC = "_local/couchdb-sync-origin";
@@ -68,6 +75,24 @@ const UNCLEAN_START_LIMIT = 3;
  * the server on every tick.
  */
 const REMOTE_SCAN_TTL_MS = 15_000;
+
+/**
+ * The answer to "what will Reset server destroy here?", taken fresh in front of the
+ * confirmation (see `previewServerReset`).
+ *
+ * A union rather than a struct with optional fields, so the caller cannot read a
+ * delta that was never measured: an unreachable server produces `checked: false`,
+ * and an unknown delta must never render as "nothing to lose". A guard that is
+ * silent when it cannot tell is worse than none — it is trusted for the wrong reason.
+ */
+export type ResetPreflight =
+	| { checked: false; reason: string }
+	| {
+			checked: true;
+			delta: PathDelta;
+			/** server docs that failed to decrypt — files the delta cannot name */
+			unreadable: number;
+	  };
 
 function localDbName(settings: CouchDBSyncSettings): string {
 	return `${LOCAL_DB_PREFIX}-${settings.localDbId}`;
@@ -836,6 +861,67 @@ export default class CouchDBSyncPlugin extends Plugin {
 		// server and uploaded nothing. Going through restartSync is also the path the
 		// user's own "Force sync" takes, which is the one this has to match.
 		await this.restartSync();
+	}
+
+	/**
+	 * What a "Reset server" would cost, taken immediately before the confirmation.
+	 *
+	 * `checked: false` means the question could not be answered — an UNKNOWN delta,
+	 * which must never be presented as an empty one.
+	 */
+	async previewServerReset(): Promise<ResetPreflight> {
+		const unknown = (reason: string): ResetPreflight => ({ checked: false, reason });
+		if (!this.settings.serverUrl || !this.settings.username) {
+			return unknown("the server connection is not configured yet");
+		}
+		if (!this.secretsUnlocked && !(await this.ensureSecretsUnlocked())) {
+			return unknown("the stored credentials are locked on this device");
+		}
+
+		// A FRESH scan, deliberately bypassing the 15 s cache getRemoteScan() keeps for
+		// the panel. That cache is right for a view that repaints constantly and wrong
+		// here: this is the one moment where a stale reading has a cost.
+		let scan: RemoteScan;
+		try {
+			scan = await this.getSharedDb().scanRemote();
+		} catch (e) {
+			return unknown(toError(e).message);
+		}
+		if (!scan.reachable) {
+			return unknown(
+				scan.error === "auth"
+					? "the server rejected these credentials"
+					: scan.error === "notfound"
+						? "the database does not exist on the server"
+						: `the server could not be reached (${scan.message ?? "network error"})`
+			);
+		}
+		// Store it: it is newer than anything the panel holds.
+		this.remoteScan = { at: Date.now(), scan };
+
+		// Compare against what the RE-UPLOAD will walk, which is this device's disk —
+		// the report's own diskPaths, filtered by exactly the skip rules the upload
+		// applies. The cache (dbCount/serverOnly) would answer a different question.
+		let report: IndexReport;
+		try {
+			report = await buildIndexReport(this.app, this.settings, this.getSharedDb(), undefined, scan);
+		} catch (e) {
+			return unknown(toError(e).message);
+		}
+		if (report.passphraseError) {
+			// Every remote doc failed to decrypt, so `serverPaths` is empty for the wrong
+			// reason. Reporting "nothing on the server" here would be the exact lie this
+			// pre-flight exists to prevent.
+			return unknown("the server's files cannot be read with this passphrase");
+		}
+		return {
+			checked: true,
+			delta: comparePaths(report.serverPaths ?? [], report.diskPaths),
+			// Documents the server holds but this device cannot decrypt are missing from
+			// `serverPaths`, so the delta UNDERSTATES the loss by exactly this many files.
+			// Silence would make that invisible; the dialog says it instead.
+			unreadable: scan.decryptFailed,
+		};
 	}
 
 	/** Whether the last doServerReset actually emptied the server (drives the restart). */

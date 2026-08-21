@@ -279,7 +279,7 @@ Available from Obsidian's command palette (`Ctrl/Cmd + P`).
 | Upload to server | — | **This device wins on the server:** overwrite the server's copy of every file with this device's, and add local-only files. Server-only files are kept (not deleted). Affects every other device |
 | Wipe local cache | — | Deletes this device's copy. The server is not touched |
 
-| Reset the server from this device | — | **Start the server over:** delete everything on it and re-upload this device's files. Also how you change your passphrase (below) |
+| Reset the server from this device | — | **Start the server over:** delete everything on it and re-upload this device's files. Checks the server first and names the files that exist only there — the ones the reset destroys — before asking. Also how you change your passphrase (below) |
 
 ### 🔁 Changing your passphrase
 
@@ -296,7 +296,9 @@ On the device whose files you trust:
 2. **Enter the new passphrase** under *Connection & encryption*.
 3. Press **Reset server** under *Actions*, and confirm. It empties the server, discards
    this device's cache and re-uploads every file under the new passphrase. Sync turns
-   itself back on.
+   itself back on. Expect an extra dialog here saying the server's files cannot be read
+   with this passphrase — that is exactly right: the new key cannot open the old
+   contents, so the plugin cannot list what the reset will delete. Continue.
 4. Wait until the counters read the same number three times over — e.g.
    `112 / 112 local · 112 / 112 on server`.
 
