@@ -399,6 +399,9 @@ that most wants its own PR and a manual two-device run before merging.
 
 ### 13. R8 Level 2 — Cloudflare Access · M–L (~2–3 days incl. verification)
 
+**Status:** implemented on `feature/cloudflare-access`; the "must be measured"
+list below is still open (needs a real tunnel). See ROADMAP R8 for what shipped.
+
 **Files:** `src/types.ts`, `src/database.ts` (`obsidianFetch`, `connectRemote`,
 `scanRemote`, `RemoteScan`), `src/settings.ts`, `src/main.ts`
 (`invalidateConnection`), README. **Not** `src/secrets.ts`.
