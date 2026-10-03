@@ -21,6 +21,7 @@ import {
 	unsealSecrets,
 } from "./secrets";
 import { askNewSecretsPassphrase, askUnlockPassphrase } from "./secretsmodal";
+import { AccessToken, loadAccessToken, remoteErrorLong, saveAccessToken, withoutAccessToken } from "./cfaccess";
 import { RemoteScan, SyncDatabase } from "./database";
 import { SyncEngine, IndexReport, buildIndexReport, removeFromDb } from "./engine";
 import { CouchDBSyncSettingTab } from "./settings";
@@ -752,6 +753,21 @@ export default class CouchDBSyncPlugin extends Plugin {
 		await this.saveSettings();
 	}
 
+	/**
+	 * Store this device's Cloudflare Access service token (device store only — never
+	 * data.json) and drop the remote handle, so the next request presents the new one.
+	 */
+	async setAccessToken(token: Partial<AccessToken>): Promise<void> {
+		const next: AccessToken = {
+			clientId: token.clientId ?? this.settings.cfAccessClientId,
+			clientSecret: token.clientSecret ?? this.settings.cfAccessClientSecret,
+		};
+		saveAccessToken(this.deviceStore, next);
+		this.settings.cfAccessClientId = next.clientId.trim();
+		this.settings.cfAccessClientSecret = next.clientSecret.trim();
+		await this.invalidateConnection();
+	}
+
 	/** Reset the verified flag — required whenever serverUrl/dbName/username change. */
 	async invalidateConnection(): Promise<void> {
 		// A changed remote invalidates the cached server scan too, so the Server column
@@ -889,11 +905,9 @@ export default class CouchDBSyncPlugin extends Plugin {
 		}
 		if (!scan.reachable) {
 			return unknown(
-				scan.error === "auth"
-					? "the server rejected these credentials"
-					: scan.error === "notfound"
-						? "the database does not exist on the server"
-						: `the server could not be reached (${scan.message ?? "network error"})`
+				scan.error === "network" || !scan.error
+					? `the server could not be reached (${scan.message ?? "network error"})`
+					: remoteErrorLong(scan.error, { accessEnabled: this.settings.cfAccessEnabled })
 			);
 		}
 		// Store it: it is newer than anything the panel holds.
@@ -1401,6 +1415,26 @@ export default class CouchDBSyncPlugin extends Plugin {
 			dirty = true;
 		}
 
+		// Cloudflare Access token: lives in the device store, never in data.json (see
+		// cfaccess.ts). A token that is nevertheless in the loaded file (hand-edited, or
+		// copied from somewhere) is moved into the device store once and then dropped
+		// from the file by the save below — unless this device already has its own,
+		// which is the per-device one and wins.
+		const stored = loadAccessToken(this.deviceStore);
+		const fromFile: AccessToken = {
+			clientId: typeof loaded?.cfAccessClientId === "string" ? loaded.cfAccessClientId : "",
+			clientSecret: typeof loaded?.cfAccessClientSecret === "string" ? loaded.cfAccessClientSecret : "",
+		};
+		if (loaded && ("cfAccessClientId" in loaded || "cfAccessClientSecret" in loaded)) {
+			if (!stored.clientId && !stored.clientSecret && (fromFile.clientId || fromFile.clientSecret)) {
+				saveAccessToken(this.deviceStore, fromFile);
+			}
+			dirty = true;
+		}
+		const token = loadAccessToken(this.deviceStore);
+		this.settings.cfAccessClientId = token.clientId;
+		this.settings.cfAccessClientSecret = token.clientSecret;
+
 		// Credentials: everything above merged the PERSISTED shape, in which the two
 		// secrets are absent (v6+) or plaintext leftovers (pre-v6). Open the sealed blob
 		// so the rest of the plugin sees the same live `settings.password` /
@@ -1641,7 +1675,9 @@ export default class CouchDBSyncPlugin extends Plugin {
 	async saveSettings(): Promise<void> {
 		const blob = await this.sealForDisk();
 		this.settings.encryptedSecrets = blob; // keep the in-memory view honest
-		await this.saveData(toPersisted(this.settings, blob));
+		// The Access token is stripped on top of the sealed secrets: it belongs to the
+		// device store only (setAccessToken), and must not reach the file on any path.
+		await this.saveData(withoutAccessToken(toPersisted(this.settings, blob)));
 	}
 
 	/**

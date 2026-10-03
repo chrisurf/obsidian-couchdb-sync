@@ -3,7 +3,8 @@ import type CouchDBSyncPlugin from "./main";
 import { HistoryModal, confirm } from "./history";
 import { DiffMergeModal } from "./diffmerge";
 import type { IndexReport } from "./engine";
-import { SYNC_STATE, SyncStatus } from "./types";
+import { RemoteError, SYNC_STATE, SyncStatus } from "./types";
+import { remoteErrorLong, remoteErrorShort } from "./cfaccess";
 
 const AUTO_REFRESH_MS = 3_000;
 
@@ -807,15 +808,11 @@ export class IndexPanel {
 		row.createSpan({ cls: "couchdb-sync-delta-txt", text: text });
 	}
 
-	private serverErrShort(e?: "auth" | "notfound" | "network"): string {
-		return e === "auth" ? "401" : e === "notfound" ? "404" : "offline";
+	private serverErrShort(e?: RemoteError): string {
+		return remoteErrorShort(e);
 	}
-	private serverErrLong(e?: "auth" | "notfound" | "network"): string {
-		return e === "auth"
-			? "the login was rejected (401). Check the user name and password."
-			: e === "notfound"
-				? "the database was not found (404). Check the database name."
-				: "could not reach the server (network/transport).";
+	private serverErrLong(e?: RemoteError): string {
+		return remoteErrorLong(e, { accessEnabled: this.plugin.settings.cfAccessEnabled });
 	}
 
 	/** The five status counters as small, card-styled widgets; each acts on its files. */
@@ -958,7 +955,7 @@ export class IndexPanel {
 		tag: string,
 		paths: string[],
 		stateByPath: Map<string, FileState>,
-		opts: { emptyRebuild?: boolean; serverReachable?: boolean; serverError?: "auth" | "notfound" | "network" }
+		opts: { emptyRebuild?: boolean; serverReachable?: boolean; serverError?: RemoteError }
 	): void {
 		const unreachable = opts.serverReachable === false;
 		const emptyRebuild = !!opts.emptyRebuild;

@@ -1,4 +1,5 @@
 import { App, Notice, PluginSettingTab, Setting, type SettingDefinitionItem, type SettingDefinitionRender } from "obsidian";
+import { accessTokenMissing } from "./cfaccess";
 import type CouchDBSyncPlugin from "./main";
 import type { ResetPreflight } from "./main";
 import { SyncDatabase } from "./database";
@@ -180,7 +181,10 @@ export class CouchDBSyncSettingTab extends PluginSettingTab {
 		const credsLocked = () =>
 			!this.plugin.secretsAreUnlocked() && this.plugin.settings.secretsMode === "ask";
 
-		const connOk = () => s.connectionVerified;
+		// A verified connection does not count while Access is on and this device has no
+		// token — data.json (and with it the flag) can arrive from another device, and
+		// the section must then stay open to ask for this device's token.
+		const connOk = () => s.connectionVerified && !accessTokenMissing(s);
 		const passStatus = () => this.plugin.passphraseStatus(); // "empty" | "mismatch" | "ok"
 		const encOk = () => passStatus() === "ok";
 		const allOk = () => connOk() && encOk();
@@ -259,7 +263,11 @@ export class CouchDBSyncSettingTab extends PluginSettingTab {
 										: "Your stored credentials cannot be read on this device (the vault was copied here, or this device's key is gone). Enter them again below."
 								);
 							}
-							if (!connOk()) {
+							if (accessTokenMissing(s)) {
+								problems.push(
+									"Cloudflare Access is on, but this device has no service token — enter its client id and secret below."
+								);
+							} else if (!connOk()) {
 								problems.push(
 									"Server connection not verified — fill in the details below and press “Test connection”."
 								);
@@ -334,6 +342,50 @@ export class CouchDBSyncSettingTab extends PluginSettingTab {
 						});
 						this.addRevealButton(setting, () => input);
 					}),
+					// --- Cloudflare Access (R8): off by default, so existing setups are untouched ---
+					row(
+						"Cloudflare Access",
+						"Turn on if the server sits behind a Cloudflare Access policy. Every request then carries this device's service token. Set the policy's action to “Service Auth”.",
+						(setting) =>
+							setting.addToggle((t) =>
+								t.setValue(s.cfAccessEnabled).onChange(async (v) => {
+									s.cfAccessEnabled = v;
+									await this.plugin.saveSettings();
+									await onCredsChanged();
+									this.update(); // show or hide the token fields
+								})
+							)
+					),
+					row(
+						"Access client ID",
+						"From the service token in Cloudflare Zero Trust. Stored on this device only — never in the vault's data.json — so enter it on each device (ideally a separate token per device).",
+						(setting) =>
+							setting.addText((t) =>
+								t
+									.setPlaceholder("xxxxxxxx.access")
+									.setValue(s.cfAccessClientId)
+									.onChange(async (v) => {
+										await this.plugin.setAccessToken({ clientId: v });
+									})
+							),
+						{ visible: () => s.cfAccessEnabled }
+					),
+					row(
+						"Access client secret",
+						"Stored on this device only, in plain form in the app's local storage. It is lost if the app's data is cleared and must then be entered again.",
+						(setting) => {
+							let input: HTMLInputElement | undefined;
+							setting.addText((t) => {
+								input = t.inputEl;
+								t.inputEl.type = "password"; // masked by default
+								t.setValue(s.cfAccessClientSecret).onChange(async (v) => {
+									await this.plugin.setAccessToken({ clientSecret: v });
+								});
+							});
+							this.addRevealButton(setting, () => input);
+						},
+						{ visible: () => s.cfAccessEnabled }
+					),
 					row(
 						"Test connection",
 						"Check the server URL, database and credentials. On success this unlocks the Index status view; if the passphrase also checks out, this section collapses.",
