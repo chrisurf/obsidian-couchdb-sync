@@ -595,6 +595,19 @@ a **service token**: two headers on every request, `CF-Access-Client-Id` and
   returns for a missing or invalid service token. The table above is the expected
   shape; confirm each row against a real tunnel before relying on the wording.
 
+**Status — implemented, real-tunnel verification still open.** Built as specified
+above: `src/cfaccess.ts` holds the pure parts (headers, device-store keys, Access
+detection, classification, wording), `obsidianFetch()` takes a header supplier, and
+`saveSettings()` strips the token on top of `toPersisted()`. Two additions beyond the
+design: a token found in `data.json` (hand-edited, copied) is moved into the device
+store once and stripped; and CouchDB's own 403 now reads as `forbidden` with
+`testConnection()` checking the status — the R14 part that the Access 403 could not
+be told apart from without. R14's feed stand-down on repeated 401/403 is not part of
+this. Covered by `tests/cfaccess.test.ts`, `tests/access-fetch.test.ts` (real PouchDB
+against a scripted server, incl. replication) and `e2e/specs/cf-access.e2e.ts` (real
+Obsidian against a local Access-like gateway). The rows below still need a real
+tunnel.
+
 **Risks to verify against a real tunnel before shipping:**
 
 - **Idle timeout vs. the live feed — probably already solved, still measure.**

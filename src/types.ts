@@ -18,6 +18,13 @@ export type SecretsMode = "device" | "ask";
  */
 export const CURRENT_SETTINGS_VERSION = 7;
 
+/**
+ * Why the remote could not be read. `forbidden` is CouchDB's own 403 (login fine, not
+ * a member of the database); the two `access-*` causes come from Cloudflare Access in
+ * front of the server (see cfaccess.ts).
+ */
+export type RemoteError = "auth" | "forbidden" | "notfound" | "access-denied" | "access-login" | "network";
+
 export interface CouchDBSyncSettings {
 	/** persisted settings schema version; drives one-time migrations */
 	schemaVersion: number;
@@ -51,6 +58,20 @@ export interface CouchDBSyncSettings {
 	 * Empty until credentials are first entered.
 	 */
 	encryptedSecrets: string;
+
+	/**
+	 * Send a Cloudflare Access service token with every request (R8). Off by default,
+	 * so a configuration written before this existed behaves exactly as it did. This
+	 * switch is the only Access field persisted in `data.json`.
+	 */
+	cfAccessEnabled: boolean;
+	/**
+	 * Access service-token client id and secret. RUNTIME ONLY — kept in the device
+	 * store, never in `data.json` in any form (see cfaccess.ts for why that differs
+	 * from how `password` is stored).
+	 */
+	cfAccessClientId: string;
+	cfAccessClientSecret: string;
 
 	/** how conflicts are resolved automatically, without prompting */
 	conflictStrategy: ConflictStrategy;
@@ -221,6 +242,9 @@ export const DEFAULT_SETTINGS: CouchDBSyncSettings = {
 	passphrase: "",
 	secretsMode: "device",
 	encryptedSecrets: "",
+	cfAccessEnabled: false,
+	cfAccessClientId: "",
+	cfAccessClientSecret: "",
 	conflictStrategy: "newest",
 	isMaster: false,
 	deviceId: "",

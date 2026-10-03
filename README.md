@@ -159,16 +159,35 @@ cloudflared tunnel route dns obsidian couch.example.com
 cloudflared tunnel run --url http://127.0.0.1:5984 obsidian
 ```
 
-Then enter `https://couch.example.com` as the web address in Step 2. There is no
-setting for this in the plugin — the tunnel is invisible to it.
+Then enter `https://couch.example.com` as the web address in Step 2. A plain
+tunnel needs no setting in the plugin — it is invisible to it.
 
 > ⚠️ **A tunnel hides where your server is; it does not lock the door.** Anyone
 > who knows the hostname reaches your CouchDB, so `require_valid_user = true`
 > below and a strong password are what actually protect it.
->
-> Do **not** put a Cloudflare Access policy in front of the hostname: Access
-> answers unauthenticated requests with a login page rather than your data, and
-> the plugin cannot present a service token yet. Sync would stop working.
+
+**Locking the door: Cloudflare Access (optional).** To let only your own devices
+reach the hostname at all, put a [Cloudflare Access](https://developers.cloudflare.com/cloudflare-one/policies/access/)
+application in front of it and give each device a **service token**:
+
+1. In Cloudflare Zero Trust, create a service token per device (*Access → Service
+   Auth → Service Tokens*). Copy the client ID and client secret — the secret is
+   shown only once.
+2. Add a policy to the application for `couch.example.com` whose action is
+   **Service Auth** and which includes those tokens. With any other action, Access
+   answers the plugin with a login page.
+3. In the plugin, under *Connection & encryption*, turn on **Cloudflare Access**,
+   paste the client ID and secret, and press **Test**.
+
+The token is stored **on that device only** — in Obsidian's app storage, never in
+the vault's `data.json` — so a backup or a synced copy of the vault does not carry
+it. That is also why you enter it on every device, and again if the app's data is
+ever cleared. The switch itself is part of the settings, so a device that is
+missing its token says so instead of failing silently.
+
+If the test fails, the message names which door is shut: a rejected token
+(wrong, expired or revoked), a policy that is not set to *Service Auth*, or — past
+Access — CouchDB itself refusing the user name and password.
 
 **One-time server setting.** However you got your server, open its configuration
 and add this. It lets Obsidian talk to it and allows large files:

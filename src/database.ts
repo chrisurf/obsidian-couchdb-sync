@@ -5,8 +5,17 @@ import {
 	CouchDBSyncSettings,
 	FileDoc,
 	FILE_PREFIX,
+	RemoteError,
 	VersionDoc,
 } from "./types";
+import {
+	accessErrorBody,
+	accessHeaders,
+	accessTokenMissing,
+	classifyRemoteError,
+	detectAccessResponse,
+	remoteErrorLong,
+} from "./cfaccess";
 import {
 	Wire,
 	dehydrateFile,
@@ -46,7 +55,7 @@ export interface ChunkBytes {
 export interface RemoteScan {
 	reachable: boolean;
 	/** why the remote could not be read: bad credentials, missing DB, or transport. */
-	error?: "auth" | "notfound" | "network";
+	error?: RemoteError;
 	message?: string;
 	/** decrypted, non-deleted file paths that exist on the server */
 	paths: string[];
@@ -72,8 +81,13 @@ async function attachmentToBytes(x: unknown): Promise<Uint8Array> {
  * A fetch() implementation backed by Obsidian's requestUrl(). This bypasses the
  * browser/WebView CORS layer entirely, which removes the single biggest source of
  * "works in the browser but not in the app" failures (especially on mobile).
+ *
+ * It is also the ONE place every request to the server passes through — replication,
+ * the direct server scan, the connection test — so it is where the Cloudflare Access
+ * headers are added (`extraHeaders`, read per request) and where an Access page is
+ * caught before it reaches PouchDB's JSON parser (see detectAccessResponse).
  */
-function obsidianFetch(): typeof fetch {
+export function obsidianFetch(extraHeaders: () => Record<string, string> = () => ({})): typeof fetch {
 	return async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
 		// Each variant carries its URL in a different place. `toString()` on a Request
 		// yields "[object Object]", which would have been sent as the request URL had
@@ -92,6 +106,8 @@ function obsidianFetch(): typeof fetch {
 			}
 		}
 
+		Object.assign(headers, extraHeaders());
+
 		const param: RequestUrlParam = {
 			url,
 			method: init?.method ?? "GET",
@@ -103,6 +119,15 @@ function obsidianFetch(): typeof fetch {
 		}
 
 		const res = await requestUrl(param);
+		const access = detectAccessResponse(res.status, res.headers);
+		if (access) {
+			// Hand PouchDB a JSON error it can parse, carrying the cause in `error`
+			// (it becomes the thrown error's `name`; see classifyRemoteError).
+			return new Response(JSON.stringify(accessErrorBody(access)), {
+				status: 403,
+				headers: { "content-type": "application/json" },
+			});
+		}
 		const body =
 			res.arrayBuffer && res.arrayBuffer.byteLength > 0 ? res.arrayBuffer : res.text;
 		return new Response(body, {
@@ -221,6 +246,15 @@ export class SyncDatabase {
 		return `${base}/${encodeURIComponent(this.settings.dbName)}`;
 	}
 
+	/**
+	 * The fetch every remote handle uses. The Access headers are read from the live
+	 * settings on each request; a token edit still goes through closeRemote() so the
+	 * cached scan state is dropped along with the handle.
+	 */
+	private remoteFetch(): typeof fetch {
+		return obsidianFetch(() => accessHeaders(this.settings));
+	}
+
 	connectRemote(): PouchDB.Database<FileDoc> {
 		// Close any prior handle before replacing it — idle history/conflict reads
 		// call this repeatedly, and orphaning the old PouchDB leaks its fetch state.
@@ -229,7 +263,7 @@ export class SyncDatabase {
 		}
 		this.remote = new PouchDB<FileDoc>(this.remoteUrl(), {
 			auth: { username: this.settings.username, password: this.settings.password },
-			fetch: obsidianFetch(),
+			fetch: this.remoteFetch(),
 			skip_setup: true,
 		});
 		return this.remote;
@@ -258,20 +292,58 @@ export class SyncDatabase {
 		return !!this.settings.username && !!this.settings.password;
 	}
 
-	/** Verify credentials + reachability. Returns a human-readable result. */
-	async testConnection(): Promise<{ ok: boolean; message: string }> {
+	/**
+	 * Verify credentials + reachability. Returns a human-readable result.
+	 *
+	 * Reads the database root itself and checks the STATUS, rather than going through
+	 * `info()`: PouchDB's info() parses whatever body comes back without looking at the
+	 * status, so a JSON error body (CouchDB's 403 "not a member", or the Access error
+	 * the fetch wrapper substitutes) was reported as a successful connection.
+	 */
+	async testConnection(): Promise<{ ok: boolean; message: string; error?: RemoteError }> {
+		const accessEnabled = this.settings.cfAccessEnabled;
+		if (accessTokenMissing(this.settings)) {
+			return {
+				ok: false,
+				error: "access-denied",
+				message:
+					"Cloudflare Access is turned on, but this device has no service token yet. Enter the client id and secret.",
+			};
+		}
 		try {
-			const r = this.connectRemote();
-			const info = await r.info();
+			const r = this.connectRemote() as unknown as {
+				fetch(path: string, opts?: RequestInit): Promise<Response>;
+			};
+			const res = await r.fetch("", { method: "GET", headers: new Headers({ Accept: "application/json" }) });
+			const body = (await res.json().catch(() => null)) as {
+				db_name?: unknown;
+				doc_count?: unknown;
+				error?: string;
+			} | null;
+			if (!res.ok || !body || typeof body.db_name !== "string") {
+				const error = classifyRemoteError({
+					status: res.ok ? undefined : res.status,
+					name: body?.error,
+				});
+				// A 2xx whose body is not database info is not "offline" — say what came back.
+				const detail =
+					error === "network"
+						? `unexpected answer from the server (HTTP ${res.status}).`
+						: remoteErrorLong(error, { accessEnabled });
+				return { ok: false, error, message: `Connection failed: ${detail}` };
+			}
 			return {
 				ok: true,
-				message: `Connected to "${info.db_name}" (${info.doc_count} docs).`,
+				message: `Connected to "${body.db_name}" (${String(body.doc_count)} docs).`,
 			};
 		} catch (e: unknown) {
 			const err = e as { status?: number; message?: string; name?: string };
-			if (err.status === 401) return { ok: false, message: "Authentication failed (401). Check user/password." };
-			if (err.status === 404) return { ok: false, message: "Database not found (404). Check the database name." };
-			return { ok: false, message: `Connection failed: ${err.message ?? err.name ?? "unknown error"}` };
+			const error = classifyRemoteError(err);
+			const detail =
+				error === "network"
+					? `${remoteErrorLong(error)} (${err.message ?? err.name ?? "unknown error"})`
+					: remoteErrorLong(error, { accessEnabled });
+			return { ok: false, error, message: `Connection failed: ${detail}` };
 		}
 	}
 
@@ -392,6 +464,19 @@ export class SyncDatabase {
 				decryptFailed: 0,
 			};
 		}
+		// Same reasoning for an Access switch with no token on this device: every
+		// request would be refused, so do not send them.
+		if (accessTokenMissing(this.settings)) {
+			return {
+				reachable: false,
+				error: "access-denied",
+				message: "no Cloudflare Access token on this device",
+				paths: [],
+				conflicts: [],
+				count: 0,
+				decryptFailed: 0,
+			};
+		}
 		const r = this.remote ?? this.connectRemote();
 		let res: PouchDB.Core.AllDocsResponse<FileDoc>;
 		try {
@@ -403,8 +488,7 @@ export class SyncDatabase {
 			});
 		} catch (e: unknown) {
 			const err = e as { status?: number; message?: string; name?: string };
-			const error =
-				err.status === 401 ? "auth" : err.status === 404 ? "notfound" : "network";
+			const error = classifyRemoteError(err);
 			return {
 				reachable: false,
 				error,
@@ -753,7 +837,7 @@ export class SyncDatabase {
 		this.hydratedRemoteCache.clear();
 		const fresh = new PouchDB<FileDoc>(this.remoteUrl(), {
 			auth: { username: this.settings.username, password: this.settings.password },
-			fetch: obsidianFetch(),
+			fetch: this.remoteFetch(),
 		});
 		try {
 			await fresh.info(); // forces the create and proves it worked

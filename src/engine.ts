@@ -20,6 +20,7 @@ import {
 	HISTORY_PREFIX,
 	HISTORY_SEP,
 	RECONCILE_INTERVAL_MS,
+	RemoteError,
 	SYNC_STATE,
 	SyncRecord,
 	SyncState,
@@ -94,7 +95,7 @@ export interface IndexReport {
 	/** undefined when no remote scan was performed; else whether the server answered. */
 	serverReachable?: boolean;
 	/** why the server could not be read (only when serverReachable === false). */
-	serverError?: "auth" | "notfound" | "network";
+	serverError?: RemoteError;
 	serverCount?: number; // C — non-skipped file paths on the server
 	serverPaths?: string[]; // C — for the Server tree
 	serverOnly?: string[]; // on the server, not in the local cache — "this device is behind"
