@@ -15,7 +15,9 @@ import {
 	clearSecretKeyCache,
 	decideSealAction,
 	DeviceKeyStore,
+	blobToOpen,
 	loadOrCreateDeviceKey,
+	placeBlob,
 	sealSecrets,
 	toPersisted,
 	unsealSecrets,
@@ -149,6 +151,8 @@ export default class CouchDBSyncPlugin extends Plugin {
 	private secretKey: string | null = null;
 	/** The sealed blob exactly as it sits on disk. */
 	private sealedSecrets = "";
+	/** The blob `data.json` holds; in "device" mode this device's own is elsewhere (secrets.ts). */
+	private fileSecrets = "";
 	/**
 	 * True once the blob has been opened — or there was nothing to open (fresh vault,
 	 * or a pre-v6 config whose plaintext is still in memory waiting to be sealed).
@@ -1437,8 +1441,9 @@ export default class CouchDBSyncPlugin extends Plugin {
 		// secrets are absent (v6+) or plaintext leftovers (pre-v6). Open the sealed blob
 		// so the rest of the plugin sees the same live `settings.password` /
 		// `settings.passphrase` it always has.
-		this.sealedSecrets =
+		this.fileSecrets =
 			typeof this.settings.encryptedSecrets === "string" ? this.settings.encryptedSecrets : "";
+		this.sealedSecrets = blobToOpen(this.settings.secretsMode, this.fileSecrets, this.deviceStore);
 		await this.openSecrets();
 		// A pre-v6 config arrives with plaintext credentials in `loaded`; the save below
 		// (dirty is set by the schema bump) is what seals them and drops the plain keys.
@@ -1677,7 +1682,9 @@ export default class CouchDBSyncPlugin extends Plugin {
 		// device store only (setAccessToken), and must not reach the file on any path.
 		// The device identity likewise belongs to the device store (device.ts).
 		saveDeviceState(this.deviceStore, this.settings);
-		await this.saveData(withoutDeviceState(withoutAccessToken(toPersisted(this.settings, blob))));
+		// A "device" blob stays on this device; the file keeps what it had (secrets.ts).
+		this.fileSecrets = placeBlob(this.settings.secretsMode, blob, this.fileSecrets, this.deviceStore);
+		await this.saveData(withoutDeviceState(withoutAccessToken(toPersisted(this.settings, this.fileSecrets))));
 	}
 
 	/**

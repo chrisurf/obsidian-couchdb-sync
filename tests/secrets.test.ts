@@ -1,11 +1,14 @@
 import { describe, it, expect } from "vitest";
 import {
+	blobToOpen,
 	decideSealAction,
+	DEVICE_SECRETS_STORAGE_KEY,
 	DEVICE_KEY_STORAGE_KEY,
 	DeviceKeyStore,
 	generateDeviceKey,
 	isSealed,
 	loadOrCreateDeviceKey,
+	placeBlob,
 	sealSecrets,
 	toPersisted,
 	unsealSecrets,
@@ -165,5 +168,58 @@ describe("toPersisted", () => {
 		toPersisted(settings, "s1:iv:cipher");
 		expect(settings.password).toBe("hunter2");
 		expect(settings.passphrase).toBe("correct horse battery staple");
+	});
+});
+
+describe("where the sealed credentials live", () => {
+	const creds = { password: "hunter2", passphrase: "correct horse battery staple" };
+
+	/** One device: its store, and a save that writes the shared file. */
+	function device() {
+		const store = fakeStore();
+		const key = loadOrCreateDeviceKey(store)!;
+		return {
+			store,
+			async save(file: { blob: string }) {
+				const blob = await sealSecrets(creds, key);
+				file.blob = placeBlob("device", blob, file.blob, store);
+			},
+			open: (file: { blob: string }) => unsealSecrets(blobToOpen("device", file.blob, store), key),
+		};
+	}
+
+	it("two Macs sharing one data.json both stay unlocked", async () => {
+		const file = { blob: "" };
+		const a = device();
+		const b = device();
+		await a.save(file);
+		await b.save(file);
+		await a.save(file);
+		expect(await a.open(file)).toEqual(creds);
+		expect(await b.open(file)).toEqual(creds);
+		expect(file.blob).toBe(""); // no device-bound blob reaches the file
+	});
+
+	it("an existing blob in the file is still opened once, then kept on the device", async () => {
+		const a = device();
+		const key = a.store.get(DEVICE_KEY_STORAGE_KEY)!;
+		const file = { blob: await sealSecrets(creds, key) };
+		const old = file.blob;
+		expect(await a.open(file)).toEqual(creds);
+		await a.save(file);
+		expect(file.blob).toBe(old); // left for others that may still migrate from it
+		expect(a.store.data.get(DEVICE_SECRETS_STORAGE_KEY)).toBeTruthy();
+	});
+
+	it("a locked save does not adopt another device's blob", () => {
+		const store = fakeStore();
+		expect(placeBlob("device", "s1:foreign", "s1:foreign", store)).toBe("s1:foreign");
+		expect(store.data.has(DEVICE_SECRETS_STORAGE_KEY)).toBe(false);
+	});
+
+	it("an \"ask\" blob travels in the file", () => {
+		const store = fakeStore({ [DEVICE_SECRETS_STORAGE_KEY]: "s1:device" });
+		expect(placeBlob("ask", "s1:ask", "", store)).toBe("s1:ask");
+		expect(blobToOpen("ask", "s1:ask", store)).toBe("s1:ask");
 	});
 });
