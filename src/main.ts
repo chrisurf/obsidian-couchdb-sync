@@ -22,6 +22,7 @@ import {
 } from "./secrets";
 import { askNewSecretsPassphrase, askUnlockPassphrase } from "./secretsmodal";
 import { AccessToken, loadAccessToken, remoteErrorLong, saveAccessToken, withoutAccessToken } from "./cfaccess";
+import { DEVICE_KEYS, adoptDeviceState, saveDeviceState, withoutDeviceState } from "./device";
 import { RemoteScan, SyncDatabase } from "./database";
 import { SyncEngine, IndexReport, buildIndexReport, removeFromDb } from "./engine";
 import { CouchDBSyncSettingTab } from "./settings";
@@ -1404,16 +1405,13 @@ export default class CouchDBSyncPlugin extends Plugin {
 			dirty = true;
 		}
 
-		if (!this.settings.deviceId) {
-			this.settings.deviceId = generateDeviceId();
-			dirty = true;
-		}
-		// Vault-isolated local PouchDB name (see LOCAL_DB_PREFIX comment). The id is
-		// random so two vaults can never collide even if they share a name or path.
-		if (!this.settings.localDbId) {
-			this.settings.localDbId = generateDeviceId();
-			dirty = true;
-		}
+		// This device's identity (device id, local replica id, master flag, crash
+		// guard) lives in the device store, not in data.json (see device.ts): a vault
+		// carried to another device must not carry this device's identity along.
+		// The local replica id stays random, so two vaults can never collide even if
+		// they share a name or path (see LOCAL_DB_PREFIX comment).
+		if (adoptDeviceState(this.settings, this.deviceStore, generateDeviceId)) dirty = true;
+		if (loaded && DEVICE_KEYS.some((k) => k in loaded)) dirty = true; // strip them from the file
 
 		// Cloudflare Access token: lives in the device store, never in data.json (see
 		// cfaccess.ts). A token that is nevertheless in the loaded file (hand-edited, or
@@ -1677,7 +1675,9 @@ export default class CouchDBSyncPlugin extends Plugin {
 		this.settings.encryptedSecrets = blob; // keep the in-memory view honest
 		// The Access token is stripped on top of the sealed secrets: it belongs to the
 		// device store only (setAccessToken), and must not reach the file on any path.
-		await this.saveData(withoutAccessToken(toPersisted(this.settings, blob)));
+		// The device identity likewise belongs to the device store (device.ts).
+		saveDeviceState(this.deviceStore, this.settings);
+		await this.saveData(withoutDeviceState(withoutAccessToken(toPersisted(this.settings, blob))));
 	}
 
 	/**
