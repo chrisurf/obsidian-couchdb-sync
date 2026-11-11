@@ -2020,9 +2020,20 @@ export class SyncEngine {
 		if (conflicted.length === 0) return;
 
 		const masterId = await this.getMasterId();
+		let resolved = 0;
 		for (const doc of conflicted) {
 			const revs = [doc._rev!, ...(doc._conflicts ?? [])];
-			const cands = await Promise.all(revs.map((r) => this.db.getRev(doc._id, r)));
+			// A revision this device cannot read (written by a newer plugin version, or
+			// under another passphrase) leaves this file's conflict as it is: dropping it
+			// would delete another device's edit unseen. It must not stop the loop either —
+			// one such file used to leave every other conflict in the vault unresolved.
+			let cands: FileDoc[];
+			try {
+				cands = await Promise.all(revs.map((r) => this.db.getRev(doc._id, r)));
+			} catch (e) {
+				console.warn("[couchdb-sync] conflict left unresolved: a revision cannot be read", doc.path, e);
+				continue;
+			}
 
 			const winner = pickConflictWinner(cands, this.settings.conflictStrategy, masterId);
 
@@ -2041,8 +2052,9 @@ export class SyncEngine {
 			}
 			this.lastHash.delete(doc.path);
 			await this.applyRemoteChange({ ...winner, _rev: undefined });
+			resolved++;
 		}
-		this.setStatus(SYNC_STATE.SYNCED, `Resolved ${conflicted.length} conflict(s).`);
+		if (resolved > 0) this.setStatus(SYNC_STATE.SYNCED, `Resolved ${resolved} conflict(s).`);
 	}
 
 	/**
