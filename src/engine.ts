@@ -1117,7 +1117,15 @@ export class SyncEngine {
 		for (const path of [...this.syncState.keys()]) {
 			if (this.aborted) return;
 			if (isHidden(path) || this.skip(path) || onDisk.has(path)) continue;
-			if (!(await adapter.exists(path))) await this.handleLocalDelete(path);
+			try {
+				if (!(await adapter.exists(path))) await this.handleLocalDelete(path);
+			} catch (e) {
+				// One document this device cannot read (written by a newer plugin version,
+				// or under another passphrase) stays as it is — tombstoning it would delete
+				// another device's edit unseen — and must not abort the sweep: the rest of
+				// the deletes and the persist below would never run.
+				console.warn("[couchdb-sync] delete not synced: the server's copy cannot be read", path, e);
+			}
 		}
 	}
 
