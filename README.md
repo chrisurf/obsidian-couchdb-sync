@@ -373,6 +373,16 @@ requests at all.
 
 ---
 
+## 🙏 Credits
+
+CouchDB Sync is inspired by [Self-hosted LiveSync](https://github.com/vrtmrz/obsidian-livesync)
+by vorotamoroz, which proved that PouchDB/CouchDB replication makes a great Obsidian
+sync. This plugin takes a narrower path: one CouchDB server, always end-to-end
+encrypted, as few options as possible — and a simple UI that shows at a glance what
+is syncing, without interrupting you.
+
+---
+
 ## ☕ Support
 
 CouchDB Sync is free and open source, built and maintained in my spare time. If
