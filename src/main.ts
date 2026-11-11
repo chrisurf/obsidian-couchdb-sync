@@ -15,13 +15,16 @@ import {
 	clearSecretKeyCache,
 	decideSealAction,
 	DeviceKeyStore,
+	blobToOpen,
 	loadOrCreateDeviceKey,
+	placeBlob,
 	sealSecrets,
 	toPersisted,
 	unsealSecrets,
 } from "./secrets";
 import { askNewSecretsPassphrase, askUnlockPassphrase } from "./secretsmodal";
 import { AccessToken, loadAccessToken, remoteErrorLong, saveAccessToken, withoutAccessToken } from "./cfaccess";
+import { DEVICE_KEYS, adoptDeviceState, saveDeviceState, withoutDeviceState } from "./device";
 import { RemoteScan, SyncDatabase } from "./database";
 import { SyncEngine, IndexReport, buildIndexReport, removeFromDb } from "./engine";
 import { CouchDBSyncSettingTab } from "./settings";
@@ -148,6 +151,8 @@ export default class CouchDBSyncPlugin extends Plugin {
 	private secretKey: string | null = null;
 	/** The sealed blob exactly as it sits on disk. */
 	private sealedSecrets = "";
+	/** The blob `data.json` holds; in "device" mode this device's own is elsewhere (secrets.ts). */
+	private fileSecrets = "";
 	/**
 	 * True once the blob has been opened — or there was nothing to open (fresh vault,
 	 * or a pre-v6 config whose plaintext is still in memory waiting to be sealed).
@@ -1404,16 +1409,13 @@ export default class CouchDBSyncPlugin extends Plugin {
 			dirty = true;
 		}
 
-		if (!this.settings.deviceId) {
-			this.settings.deviceId = generateDeviceId();
-			dirty = true;
-		}
-		// Vault-isolated local PouchDB name (see LOCAL_DB_PREFIX comment). The id is
-		// random so two vaults can never collide even if they share a name or path.
-		if (!this.settings.localDbId) {
-			this.settings.localDbId = generateDeviceId();
-			dirty = true;
-		}
+		// This device's identity (device id, local replica id, master flag, crash
+		// guard) lives in the device store, not in data.json (see device.ts): a vault
+		// carried to another device must not carry this device's identity along.
+		// The local replica id stays random, so two vaults can never collide even if
+		// they share a name or path (see LOCAL_DB_PREFIX comment).
+		if (adoptDeviceState(this.settings, this.deviceStore, generateDeviceId)) dirty = true;
+		if (loaded && DEVICE_KEYS.some((k) => k in loaded)) dirty = true; // strip them from the file
 
 		// Cloudflare Access token: lives in the device store, never in data.json (see
 		// cfaccess.ts). A token that is nevertheless in the loaded file (hand-edited, or
@@ -1439,8 +1441,9 @@ export default class CouchDBSyncPlugin extends Plugin {
 		// secrets are absent (v6+) or plaintext leftovers (pre-v6). Open the sealed blob
 		// so the rest of the plugin sees the same live `settings.password` /
 		// `settings.passphrase` it always has.
-		this.sealedSecrets =
+		this.fileSecrets =
 			typeof this.settings.encryptedSecrets === "string" ? this.settings.encryptedSecrets : "";
+		this.sealedSecrets = blobToOpen(this.settings.secretsMode, this.fileSecrets, this.deviceStore);
 		await this.openSecrets();
 		// A pre-v6 config arrives with plaintext credentials in `loaded`; the save below
 		// (dirty is set by the schema bump) is what seals them and drops the plain keys.
@@ -1677,7 +1680,11 @@ export default class CouchDBSyncPlugin extends Plugin {
 		this.settings.encryptedSecrets = blob; // keep the in-memory view honest
 		// The Access token is stripped on top of the sealed secrets: it belongs to the
 		// device store only (setAccessToken), and must not reach the file on any path.
-		await this.saveData(withoutAccessToken(toPersisted(this.settings, blob)));
+		// The device identity likewise belongs to the device store (device.ts).
+		saveDeviceState(this.deviceStore, this.settings);
+		// A "device" blob stays on this device; the file keeps what it had (secrets.ts).
+		this.fileSecrets = placeBlob(this.settings.secretsMode, blob, this.fileSecrets, this.deviceStore);
+		await this.saveData(withoutDeviceState(withoutAccessToken(toPersisted(this.settings, this.fileSecrets))));
 	}
 
 	/**

@@ -214,6 +214,37 @@ export function toPersisted(settings: CouchDBSyncSettings, blob: string): Persis
 	return out;
 }
 
+/** Device-store key for the sealed credentials in "device" mode. */
+export const DEVICE_SECRETS_STORAGE_KEY = "couchdb-sync-secrets";
+
+type SecretsModeLike = CouchDBSyncSettings["secretsMode"];
+
+/**
+ * Where the blob lives.
+ *
+ * A "device" blob is sealed with this device's key and opens nowhere else. In
+ * `data.json` it travels with the vault: a file sync tool between two Macs carries
+ * it to the other one, which cannot open it, re-seals with its own key on the next
+ * save and so locks the first one out. So in "device" mode the blob is kept in the
+ * device store, next to its key, and a save never writes a new one to the file. The
+ * file keeps the blob it was loaded with (from before this rule, or an "ask" blob),
+ * so a device that has no blob of its own yet can still migrate from it.
+ *
+ * An "ask" blob opens with the passphrase on every device, so it stays in the file.
+ */
+export function blobToOpen(mode: SecretsModeLike, fileBlob: string, store: DeviceKeyStore): string {
+	if (mode === "ask") return fileBlob;
+	return store.get(DEVICE_SECRETS_STORAGE_KEY) || fileBlob;
+}
+
+/** Keep `blob` where it belongs (see {@link blobToOpen}); returns the blob for `data.json`. */
+export function placeBlob(mode: SecretsModeLike, blob: string, fileBlob: string, store: DeviceKeyStore): string {
+	if (mode === "ask") return blob;
+	// The file's own blob, passed through while locked, is not this device's.
+	if (blob !== fileBlob) store.set(DEVICE_SECRETS_STORAGE_KEY, blob);
+	return fileBlob;
+}
+
 /** Drop cached derived keys (called when the key material changes or on unload). */
 export function clearSecretKeyCache(): void {
 	keyCache.clear();
